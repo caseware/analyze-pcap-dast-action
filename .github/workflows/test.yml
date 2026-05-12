@@ -1,0 +1,238 @@
+name: Integration Test
+
+on:
+  push:
+    branches: [main, init-main, v1]
+  pull_request:
+    branches: [main, init-main, v1]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version-bump:
+    name: Version bump check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate VERSION bump
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "::error::VERSION file is missing"
+            exit 1
+          fi
+
+          if ! grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION; then
+            echo "::error::VERSION must be strict semver (e.g. 1.2.3)"
+            exit 1
+          fi
+
+          git fetch --no-tags origin "$BASE_REF":"refs/remotes/origin/$BASE_REF"
+
+          if git diff --quiet "refs/remotes/origin/$BASE_REF"...HEAD -- VERSION; then
+            echo "::error::VERSION must be bumped in pull requests"
+            exit 1
+          fi
+
+          echo "VERSION bump detected: $(cat VERSION)"
+
+  # ───────────────────────────────────────────────────────────────────
+  # Dogfood: capture traffic to this repo's GitHub page, generate
+  # a site map, run ZAP passive scan, and upload SARIF to Security tab
+  # ───────────────────────────────────────────────────────────────────
+  test-dogfood:
+    name: "Dogfood: capture & analyze github.com"
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install mitmproxy
+        run: |
+          pip install --quiet mitmproxy==11.1.3 2>/dev/null || \
+            pip install --quiet --break-system-packages mitmproxy==11.1.3
+
+      - name: Start MinIO (S3-compatible storage)
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data --console-address ":9001"
+
+          echo "Waiting for MinIO..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Configure AWS CLI for MinIO
+          aws configure set aws_access_key_id minioadmin
+          aws configure set aws_secret_access_key minioadmin
+          aws configure set default.region us-east-1
+
+          aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000
+
+      - name: Capture traffic via mitmproxy
+        run: |
+          set -euo pipefail
+          CAPTURE_DIR="${RUNNER_TEMP}/capture"
+          mkdir -p "$CAPTURE_DIR/.mitmproxy"
+
+          export SSLKEYLOGFILE="$CAPTURE_DIR/sslkeys.log"
+
+          # Start mitmproxy
+          mitmdump \
+            --mode regular \
+            --listen-port 8080 \
+            --set confdir="$CAPTURE_DIR/.mitmproxy" \
+            --set ssl_insecure=true \
+            --save-stream-file "$CAPTURE_DIR/mitmproxy-flows" \
+            --quiet &
+          MITM_PID=$!
+          echo "$MITM_PID" > "$CAPTURE_DIR/mitmdump.pid"
+          sleep 3
+
+          CA_CERT="$CAPTURE_DIR/.mitmproxy/mitmproxy-ca-cert.pem"
+
+          # Make requests through the proxy to this repo's GitHub page
+          export http_proxy=http://127.0.0.1:8080
+          export https_proxy=http://127.0.0.1:8080
+
+          echo "::group::Fetching GitHub pages"
+
+          curl -sS --max-time 30 --cacert "$CA_CERT" \
+            -o /dev/null -w "repo page: HTTP %{http_code}\n" \
+            https://github.com/caseware/analyze-pcap-dast-action || true
+
+          curl -sS --max-time 30 --cacert "$CA_CERT" \
+            -o /dev/null -w "org page: HTTP %{http_code}\n" \
+            https://github.com/caseware || true
+
+          curl -sS --max-time 30 --cacert "$CA_CERT" \
+            -o /dev/null -w "github api: HTTP %{http_code}\n" \
+            https://api.github.com/repos/caseware/analyze-pcap-dast-action || true
+
+          echo "::endgroup::"
+
+          unset http_proxy https_proxy
+
+          # Stop mitmproxy
+          kill "$MITM_PID" 2>/dev/null || true
+          sleep 2
+          kill -9 "$MITM_PID" 2>/dev/null || true
+
+          # Bundle and upload to MinIO
+          BUNDLE_DIR="$CAPTURE_DIR/bundle"
+          mkdir -p "$BUNDLE_DIR"
+          for f in mitmproxy-flows sslkeys.log; do
+            [ -f "$CAPTURE_DIR/$f" ] && cp "$CAPTURE_DIR/$f" "$BUNDLE_DIR/"
+          done
+          [ -f "$CA_CERT" ] && cp "$CA_CERT" "$BUNDLE_DIR/"
+
+          ARTIFACT="dogfood-$(date +%Y%m%dT%H%M%SZ)"
+          tar -czf "$CAPTURE_DIR/$ARTIFACT.tar.gz" -C "$BUNDLE_DIR" .
+
+          aws s3 cp "$CAPTURE_DIR/$ARTIFACT.tar.gz" \
+            "s3://test-pcap/pcap-captures/$ARTIFACT.tar.gz" \
+            --endpoint-url http://localhost:9000
+
+          echo "capture-dir=$CAPTURE_DIR" >> "$GITHUB_ENV"
+          echo "Capture complete, uploaded to MinIO"
+
+      - name: Create passive DAST site map
+        uses: ./create-passive-dast-map
+        id: sitemap
+        with:
+          s3-bucket: 'test-pcap'
+          s3-prefix: 'pcap-captures'
+          s3-endpoint: 'http://localhost:9000'
+          hours: '1'
+
+      - name: Verify site map outputs
+        run: |
+          set -euo pipefail
+          echo "=== HAR ==="
+          if [ -f "${{ steps.sitemap.outputs.har-file }}" ]; then
+            SIZE=$(stat -c%s "${{ steps.sitemap.outputs.har-file }}")
+            ENTRIES=$(python3 -c "
+          import json
+          with open('${{ steps.sitemap.outputs.har-file }}') as f:
+              print(len(json.load(f)['log']['entries']))
+          ")
+            echo "HAR: $SIZE bytes, $ENTRIES entries"
+            [ "$SIZE" -gt 100 ] || { echo "::error::HAR too small"; exit 1; }
+          else
+            echo "::error::HAR file missing"; exit 1
+          fi
+
+          echo "=== URL list ==="
+          if [ -f "${{ steps.sitemap.outputs.url-list }}" ]; then
+            cat "${{ steps.sitemap.outputs.url-list }}"
+            LINES=$(wc -l < "${{ steps.sitemap.outputs.url-list }}")
+            echo "URLs: $LINES"
+            [ "$LINES" -gt 0 ] || { echo "::error::URL list empty"; exit 1; }
+          else
+            echo "::error::URL list missing"; exit 1
+          fi
+
+          echo "=== Burp XML ==="
+          if [ -f "${{ steps.sitemap.outputs.burp-xml }}" ]; then
+            SIZE=$(stat -c%s "${{ steps.sitemap.outputs.burp-xml }}")
+            echo "Burp XML: $SIZE bytes"
+            [ "$SIZE" -gt 100 ] || { echo "::error::Burp XML too small"; exit 1; }
+          else
+            echo "::error::Burp XML missing"; exit 1
+          fi
+
+          echo "URL count: ${{ steps.sitemap.outputs.url-count }}"
+          echo "Domain count: ${{ steps.sitemap.outputs.domain-count }}"
+
+      - name: Run DAST passive analysis
+        uses: ./analyze-pcap-dast
+        id: dast
+        with:
+          har-file: ${{ steps.sitemap.outputs.har-file }}
+          fail-on-risk: 'none'
+          upload-sarif: 'true'
+
+      - name: Verify DAST outputs
+        run: |
+          echo "SARIF file: ${{ steps.dast.outputs.sarif-file }}"
+          echo "Alerts: ${{ steps.dast.outputs.alert-count }}"
+          echo "  High: ${{ steps.dast.outputs.high-count }}"
+          echo "  Medium: ${{ steps.dast.outputs.medium-count }}"
+          echo "  Low: ${{ steps.dast.outputs.low-count }}"
+
+          if [ -f "${{ steps.dast.outputs.sarif-file }}" ]; then
+            SIZE=$(stat -c%s "${{ steps.dast.outputs.sarif-file }}")
+            echo "SARIF size: $SIZE bytes"
+            # Verify it's valid JSON
+            python3 -c "import json; json.load(open('${{ steps.dast.outputs.sarif-file }}'))"
+            echo "SARIF is valid JSON"
+          else
+            echo "::error::SARIF file missing"; exit 1
+          fi
