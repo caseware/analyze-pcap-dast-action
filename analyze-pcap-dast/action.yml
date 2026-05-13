@@ -98,8 +98,16 @@ runs:
         set -euo pipefail
 
         echo "::group::Running ZAP passive scan"
+        # Create a minimal passwd so the container resolves HOME to /zap
+        ZAP_PASSWD="$WORK_DIR/passwd"
+        echo "zap:x:$(id -u):$(id -g):zap:/zap:/sbin/nologin" > "$ZAP_PASSWD"
+        # Pre-create .ZAP home dir — runner UID can't write to /zap/ in the image
+        ZAP_HOME_DIR="$WORK_DIR/dot-ZAP"
+        mkdir -p "$ZAP_HOME_DIR"
         docker run --rm \
           --user "$(id -u):$(id -g)" \
+          -v "$ZAP_PASSWD:/etc/passwd:ro" \
+          -v "$ZAP_HOME_DIR:/zap/.ZAP:rw" \
           -v "$WORK_DIR:/zap/wrk:rw" \
           "$ZAP_IMAGE" \
           zap.sh -cmd \
@@ -116,20 +124,17 @@ runs:
         # Find the SARIF output
         ZAP_SARIF="$WORK_DIR/results.sarif"
         if [ ! -f "$ZAP_SARIF" ]; then
-          # ZAP may append .json
           ZAP_SARIF="$WORK_DIR/results.json"
         fi
 
         if [ -f "$ZAP_SARIF" ]; then
           cp "$ZAP_SARIF" "$SARIF_FILE"
-          # Fix https:// URIs for GitHub Code Scanning compatibility
           SCRIPT_DIR="${{ github.action_path }}/../scripts"
           python3 "$SCRIPT_DIR/fix-sarif-uris.py" "$SARIF_FILE"
           echo "SARIF written to $SARIF_FILE"
         else
-          echo "::warning::ZAP did not produce SARIF output"
-          # Create minimal empty SARIF
-          printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"ZAP","version":"0.0.0","rules":[]}},"results":[]}]}' > "$SARIF_FILE"
+          echo "::error::ZAP did not produce SARIF output (exit code $ZAP_EXIT)"
+          exit 1
         fi
 
         echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"

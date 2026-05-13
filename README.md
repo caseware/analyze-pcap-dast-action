@@ -6,7 +6,7 @@ Uses the output from [capture-pcap-action](https://github.com/caseware/capture-p
 
 ### `create-passive-dast-map`
 
-Downloads PCAP bundles from S3 (last N hours), extracts mitmproxy flow files, and generates site maps in three formats:
+Downloads PCAP bundles from date-partitioned S3 prefixes (last N full UTC days), extracts mitmproxy flow files, and generates site maps in three formats:
 
 | Format | File | Compatible With |
 |--------|------|-----------------|
@@ -20,7 +20,7 @@ Downloads PCAP bundles from S3 (last N hours), extracts mitmproxy flow files, an
   with:
     s3-bucket: 'my-pcap-bucket'
     s3-prefix: 'pcap-captures'
-    hours: '24'
+    days: '3'
     filter-domains: '*.myapp.com'
 ```
 
@@ -31,7 +31,7 @@ Downloads PCAP bundles from S3 (last N hours), extracts mitmproxy flow files, an
 | `s3-bucket` | Yes | — | S3 bucket containing PCAP bundles |
 | `s3-prefix` | No | `pcap-captures` | S3 key prefix to search |
 | `s3-endpoint` | No | — | Custom S3 endpoint (MinIO, LocalStack) |
-| `hours` | No | `24` | Look-back window in hours |
+| `days` | No | `1` | Look back this many full UTC days |
 | `output-dir` | No | `$RUNNER_TEMP/dast-map` | Output directory |
 | `filter-domains` | No | — | Domain allowlist (glob patterns) |
 | `filter-exclude-domains` | No | — | Domain denylist (glob patterns) |
@@ -125,7 +125,7 @@ jobs:
         id: sitemap
         with:
           s3-bucket: 'pcap-bucket'
-          hours: '1'
+          days: '1'
 
       # Run passive DAST analysis
       - uses: caseware/analyze-pcap-dast-action/analyze-pcap-dast@v1

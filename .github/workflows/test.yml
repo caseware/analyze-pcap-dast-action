@@ -156,8 +156,9 @@ jobs:
           ARTIFACT="dogfood-$(date +%Y%m%dT%H%M%SZ)"
           tar -czf "$CAPTURE_DIR/$ARTIFACT.tar.gz" -C "$BUNDLE_DIR" .
 
+          DATE_PARTITION=$(date -u +%Y/%m/%d)
           aws s3 cp "$CAPTURE_DIR/$ARTIFACT.tar.gz" \
-            "s3://test-pcap/pcap-captures/$ARTIFACT.tar.gz" \
+            "s3://test-pcap/pcap-captures/$DATE_PARTITION/$ARTIFACT.tar.gz" \
             --endpoint-url http://localhost:9000
 
           echo "capture-dir=$CAPTURE_DIR" >> "$GITHUB_ENV"
@@ -170,7 +171,7 @@ jobs:
           s3-bucket: 'test-pcap'
           s3-prefix: 'pcap-captures'
           s3-endpoint: 'http://localhost:9000'
-          hours: '1'
+          days: '1'
 
       - name: Verify site map outputs
         run: |
