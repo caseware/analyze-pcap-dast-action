@@ -100,6 +100,7 @@ runs:
         echo "::group::Running ZAP passive scan"
         docker run --rm \
           --user "$(id -u):$(id -g)" \
+          -e HOME=/zap \
           -v "$WORK_DIR:/zap/wrk:rw" \
           "$ZAP_IMAGE" \
           zap.sh -cmd \
