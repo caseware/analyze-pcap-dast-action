@@ -1,7 +1,8 @@
 name: 'Create Passive DAST Site Map'
 description: |
-  Downloads PCAP bundles from S3 (last N hours), extracts mitmproxy flows,
-  and generates site maps compatible with ZAP, Burp Suite, and Rapid7.
+  Downloads PCAP bundles from date-partitioned S3 prefixes (last N full UTC days),
+  extracts mitmproxy flows, and generates site maps compatible with ZAP, Burp Suite,
+  and Rapid7.
 
   Output formats:
     - HAR (HTTP Archive 1.2) — universal, works with ZAP/Burp/Rapid7
@@ -21,10 +22,10 @@ inputs:
     description: 'Custom S3 endpoint URL (MinIO, LocalStack, etc.).'
     required: false
     default: ''
-  hours:
-    description: 'Look back this many hours for PCAP bundles (default 24).'
+  days:
+    description: 'Look back this many full UTC days for PCAP bundles (default 1 = today only).'
     required: false
-    default: '24'
+    default: '1'
   output-dir:
     description: 'Directory to write site map files.'
     required: false
@@ -79,7 +80,7 @@ runs:
         S3_BUCKET: ${{ inputs.s3-bucket }}
         S3_PREFIX: ${{ inputs.s3-prefix }}
         S3_ENDPOINT: ${{ inputs.s3-endpoint }}
-        HOURS: ${{ inputs.hours }}
+        DAYS: ${{ inputs.days }}
         OUTPUT_DIR: ${{ inputs.output-dir }}
       run: |
         set -euo pipefail
@@ -93,38 +94,37 @@ runs:
         # Unset proxy env vars to avoid routing S3 through a capture proxy
         unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy 2>/dev/null || true
 
-        CUTOFF=$(date -u -d "$HOURS hours ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null || \
-                 date -u -v-${HOURS}H +%Y-%m-%dT%H:%M:%S)
-        echo "Looking for bundles newer than $CUTOFF"
-
         BUNDLE_COUNT=0
-        aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/" $ENDPOINT_FLAG \
-          --recursive 2>/dev/null | while IFS= read -r line; do
+        for i in $(seq 0 $((DAYS - 1))); do
+          DATE_PREFIX=$(date -u -d "$i days ago" +%Y/%m/%d 2>/dev/null || \
+                        date -u -v-${i}d +%Y/%m/%d)
+          S3_PATH="s3://$S3_BUCKET/$S3_PREFIX/$DATE_PREFIX/"
+          LOCAL_PATH="$OUTPUT_DIR/bundles/$DATE_PREFIX"
+          mkdir -p "$LOCAL_PATH"
 
-          FILE_DATE=$(echo "$line" | awk '{print $1"T"$2}')
-          FILE_KEY=$(echo "$line" | awk '{print $4}')
+          echo "Syncing $S3_PATH"
+          aws s3 sync "$S3_PATH" "$LOCAL_PATH" \
+            $ENDPOINT_FLAG --quiet --exclude '*' --include '*.tar.gz' 2>&1 || {
+            echo "::warning::s3 sync failed for $S3_PATH (exit $?)"
+            continue
+          }
 
-          if [[ "$FILE_KEY" != *.tar.gz ]]; then continue; fi
-          if [[ "$FILE_DATE" < "$CUTOFF" ]]; then continue; fi
+          for tarball in "$LOCAL_PATH"/*.tar.gz; do
+            [ -f "$tarball" ] || continue
+            BUNDLE_NAME=$(basename "$tarball" .tar.gz)
+            BUNDLE_DIR="$OUTPUT_DIR/bundles/${BUNDLE_NAME}"
+            mkdir -p "$BUNDLE_DIR"
+            tar -xzf "$tarball" -C "$BUNDLE_DIR"
 
-          BUNDLE_NAME=$(basename "$FILE_KEY" .tar.gz)
-          BUNDLE_DIR="$OUTPUT_DIR/bundles/$BUNDLE_NAME"
-          mkdir -p "$BUNDLE_DIR"
-
-          echo "Downloading s3://$S3_BUCKET/$FILE_KEY"
-          aws s3 cp "s3://$S3_BUCKET/$FILE_KEY" "$BUNDLE_DIR/bundle.tar.gz" \
-            $ENDPOINT_FLAG --quiet
-
-          tar -xzf "$BUNDLE_DIR/bundle.tar.gz" -C "$BUNDLE_DIR"
-
-          if [ -f "$BUNDLE_DIR/mitmproxy-flows" ]; then
-            cp "$BUNDLE_DIR/mitmproxy-flows" \
-               "$OUTPUT_DIR/flows/${BUNDLE_NAME}.flows"
-            BUNDLE_COUNT=$((BUNDLE_COUNT + 1))
-          fi
+            if [ -f "$BUNDLE_DIR/mitmproxy-flows" ]; then
+              cp "$BUNDLE_DIR/mitmproxy-flows" \
+                 "$OUTPUT_DIR/flows/${BUNDLE_NAME}.flows"
+              BUNDLE_COUNT=$((BUNDLE_COUNT + 1))
+            fi
+          done
         done
 
-        echo "Downloaded bundles with flow files"
+        echo "Downloaded $BUNDLE_COUNT bundles with flow files"
         ls -la "$OUTPUT_DIR/flows/" 2>/dev/null || echo "(no flows found)"
         echo "output-dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
 
