@@ -38,6 +38,10 @@ Downloads PCAP bundles from S3 (last N hours), extracts mitmproxy flow files, an
 | `filter-status-codes` | No | — | HTTP status codes to include |
 | `filter-methods` | No | — | HTTP methods to include |
 
+> **Note:** Content-type filtering is applied upstream by `capture-pcap-action`'s
+> inline mitmproxy addon (`filter-content-types` input). Flows that reach S3
+> have already been filtered, so a duplicate content-type filter is not needed here.
+
 #### Outputs
 
 | Output | Description |

@@ -1,8 +1,9 @@
 THIRD-PARTY NOTICES
 
-This action downloads or uses the following components at runtime. They are
-NOT redistributed as part of this project but are fetched on demand during
-execution:
+This repository downloads or uses the following components. They are
+NOT redistributed as part of this project but are fetched on demand.
+
+## Runtime Dependencies
 
   - mitmproxy
     License: MIT
@@ -16,11 +17,13 @@ execution:
     License: Apache License 2.0
     https://github.com/zaproxy/zaproxy/blob/main/LICENSE
 
-  - AWS CLI / boto3
+  - AWS CLI
     License: Apache License 2.0
     https://github.com/aws/aws-cli/blob/develop/LICENSE.txt
 
-  - MinIO (test dependency only)
+## CI / Test Dependencies
+
+  - MinIO (integration test S3 storage)
     License: GNU AGPLv3
     https://github.com/minio/minio/blob/master/LICENSE
 

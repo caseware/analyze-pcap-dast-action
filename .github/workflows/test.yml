@@ -78,7 +78,7 @@ jobs:
             -p 9000:9000 -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data --console-address ":9001"
+            minio/minio:RELEASE.2025-04-22T22-12-39Z server /data --console-address ":9001"
 
           echo "Waiting for MinIO..."
           for i in $(seq 1 30); do

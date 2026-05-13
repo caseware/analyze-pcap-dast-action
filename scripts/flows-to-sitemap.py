@@ -12,8 +12,6 @@ import argparse
 import base64
 import fnmatch
 import json
-import os
-import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +19,14 @@ from xml.dom import minidom
 
 from mitmproxy import io as mio
 from mitmproxy.http import HTTPFlow
+
+
+def _read_version() -> str:
+    """Read the version from the VERSION file at the repo root."""
+    version_file = Path(__file__).resolve().parent.parent / "VERSION"
+    if version_file.is_file():
+        return version_file.read_text().strip()
+    return "0.0.0"
 
 
 def _csv(value: str) -> list[str]:
@@ -60,7 +66,7 @@ def _should_include(
         return False
     if domain_deny and _glob_match(host, domain_deny):
         return False
-    if status_codes and flow.response and flow.response.status_code not in status_codes:
+    if status_codes and (not flow.response or flow.response.status_code not in status_codes):
         return False
     if methods and flow.request.method.upper() not in methods:
         return False
@@ -277,7 +283,7 @@ def main() -> None:
             "version": "1.2",
             "creator": {
                 "name": "analyze-pcap-dast-action",
-                "version": "0.1.0",
+                "version": _read_version(),
             },
             "entries": har_entries,
         }

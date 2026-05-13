@@ -1,9 +1,9 @@
 """Fix SARIF URIs for GitHub Code Scanning compatibility.
 
 ZAP produces SARIF with https:// URIs pointing to scanned web pages.
-GitHub Code Scanning requires file:// URIs relative to the repo checkout.
-This script converts web URIs to synthetic file paths so the SARIF can be
-uploaded without errors.
+GitHub Code Scanning requires relative file paths (not web URLs).
+This script converts web URIs to synthetic relative paths so the SARIF
+can be uploaded without errors.
 """
 
 from __future__ import annotations

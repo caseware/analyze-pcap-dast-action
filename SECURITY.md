@@ -16,7 +16,7 @@ We will acknowledge receipt within 3 business days and aim to provide an initial
 
 ## Scope
 
-This policy covers the action source code (`create-passive-dast-map/action.yml`, `analyze-pcap-dast/action.yml`, `scripts/flows-to-sitemap.py`, `scripts/generate-zap-plan.py`, `scripts/count-sarif-alerts.py`) and the GitHub Actions workflow configurations in this repository.
+This policy covers the action source code (`create-passive-dast-map/action.yml`, `analyze-pcap-dast/action.yml`, `scripts/flows-to-sitemap.py`, `scripts/generate-zap-plan.py`, `scripts/count-sarif-alerts.py`, `scripts/fix-sarif-uris.py`, `scripts/burp-xml-stats.py`) and the GitHub Actions workflow configurations in this repository.
 
 Vulnerabilities in third-party components (mitmproxy, OWASP ZAP, Docker images) should be reported to their respective maintainers.
 
@@ -24,4 +24,4 @@ Vulnerabilities in third-party components (mitmproxy, OWASP ZAP, Docker images) 
 
 | Version | Supported |
 |---------|-----------|
-| v0 (latest) | Yes |
+| v1 (latest) | Yes |
