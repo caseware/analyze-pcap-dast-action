@@ -56,6 +56,7 @@ Every PR must include a `VERSION` bump — the `version-bump` CI job enforces th
 | `create-passive-dast-map/action.yml` | Composite: S3 download → flow extraction → site maps |
 | `analyze-pcap-dast/action.yml` | Composite: ZAP passive scan → SARIF output |
 | `scripts/flows-to-sitemap.py` | Converts mitmproxy flows to HAR/URL/Burp XML |
+| `scripts/burp-xml-stats.py` | Extracts basic stats (URL count, params, hosts) from Burp XML |
 | `VERSION` | Strict semver version string |
 | `.github/workflows/test.yml` | Integration test (dogfood against GitHub.com) |
 | `.github/workflows/codeql.yml` | CodeQL scan (Python + Actions) on ARM64 |

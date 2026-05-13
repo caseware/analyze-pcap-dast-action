@@ -18,10 +18,6 @@ inputs:
     description: 'Path to write the SARIF output.'
     required: false
     default: '${{ runner.temp }}/zap-results.sarif'
-  zap-rules-config:
-    description: 'Path to a ZAP passive rules config YAML (overrides defaults).'
-    required: false
-    default: ''
   fail-on-risk:
     description: 'Fail the action if alerts at or above this risk level are found (none, low, medium, high). Default: none (never fail).'
     required: false
@@ -101,11 +97,9 @@ runs:
       run: |
         set -euo pipefail
 
-        # Make work dir writable by the ZAP container user (uid 1000)
-        chmod -R 777 "$WORK_DIR"
-
         echo "::group::Running ZAP passive scan"
         docker run --rm \
+          --user "$(id -u):$(id -g)" \
           -v "$WORK_DIR:/zap/wrk:rw" \
           "$ZAP_IMAGE" \
           zap.sh -cmd \
