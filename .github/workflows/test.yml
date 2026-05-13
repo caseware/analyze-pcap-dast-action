@@ -211,6 +211,25 @@ jobs:
           echo "URL count: ${{ steps.sitemap.outputs.url-count }}"
           echo "Domain count: ${{ steps.sitemap.outputs.domain-count }}"
 
+      - name: Extract Burp XML statistics
+        run: |
+          set -euo pipefail
+          python3 scripts/burp-xml-stats.py \
+            "${{ steps.sitemap.outputs.burp-xml }}" \
+            -o "${{ runner.temp }}/burp-stats.json"
+
+          echo "=== Burp XML Stats ==="
+          cat "${{ runner.temp }}/burp-stats.json"
+
+          # Verify minimum expected stats
+          URL_COUNT=$(python3 -c "
+          import json
+          s = json.load(open('${{ runner.temp }}/burp-stats.json'))
+          print(s['url_count'])
+          ")
+          echo "Extracted $URL_COUNT URLs from Burp XML"
+          [ "$URL_COUNT" -gt 0 ] || { echo "::error::Burp XML has 0 URLs"; exit 1; }
+
       - name: Run DAST passive analysis
         uses: ./analyze-pcap-dast
         id: dast
