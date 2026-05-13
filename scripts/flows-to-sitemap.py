@@ -4,6 +4,11 @@ Outputs:
   - sitemap.har   (HAR 1.2 — ZAP, Burp Suite, Rapid7, Chrome DevTools)
   - urls.txt      (one URL per line — ZAP import, Rapid7 bulk add)
   - sitemap-burp.xml (Burp Suite native XML site map)
+
+Deduplication:
+  Flows from multiple captures are deduplicated by
+  (method, URL, body SHA-256) so DAST scanners process each
+  unique request only once.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fnmatch
+import hashlib
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -247,6 +253,7 @@ def main() -> None:
     har_entries: list[dict] = []
     urls: set[str] = set()
     burp_items: list[ET.Element] = []
+    seen: set[str] = set()
 
     flow_files = sorted(flows_dir.glob("*.flows"))
     if not flow_files:
@@ -254,6 +261,7 @@ def main() -> None:
 
     total = 0
     kept = 0
+    dupes = 0
     for flow_file in flow_files:
         print(f"Processing {flow_file.name}")
         with open(flow_file, "rb") as f:
@@ -270,12 +278,27 @@ def main() -> None:
                     methods=methods,
                 ):
                     continue
+
+                body_hash = hashlib.sha256(
+                    flow.request.content or b""
+                ).hexdigest()[:16]
+                dedup_key = (
+                    f"{flow.request.method}\0"
+                    f"{flow.request.pretty_url}\0"
+                    f"{body_hash}"
+                )
+                if dedup_key in seen:
+                    dupes += 1
+                    continue
+                seen.add(dedup_key)
+
                 kept += 1
                 har_entries.append(_flow_to_har_entry(flow))
                 urls.add(flow.request.pretty_url)
                 burp_items.append(_flow_to_burp_item(flow))
 
-    print(f"Processed {total} flows, kept {kept}")
+    print(f"Processed {total} flows, kept {kept}, "
+          f"deduplicated {dupes}")
 
     # ── HAR ────────────────────────────────────────────────────────────
     har = {
