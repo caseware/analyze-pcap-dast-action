@@ -98,9 +98,12 @@ runs:
         set -euo pipefail
 
         echo "::group::Running ZAP passive scan"
-        # Fix output dir perms so the container's zap user (1000) can write
-        chmod -R 777 "$WORK_DIR"
+        # Create a minimal passwd so the container resolves HOME to /zap
+        ZAP_PASSWD="$WORK_DIR/passwd"
+        echo "zap:x:$(id -u):$(id -g):zap:/zap:/sbin/nologin" > "$ZAP_PASSWD"
         docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$ZAP_PASSWD:/etc/passwd:ro" \
           -v "$WORK_DIR:/zap/wrk:rw" \
           "$ZAP_IMAGE" \
           zap.sh -cmd \
@@ -121,8 +124,7 @@ runs:
         fi
 
         if [ -f "$ZAP_SARIF" ]; then
-          sudo cp "$ZAP_SARIF" "$SARIF_FILE"
-          sudo chown "$(id -u):$(id -g)" "$SARIF_FILE"
+          cp "$ZAP_SARIF" "$SARIF_FILE"
           SCRIPT_DIR="${{ github.action_path }}/../scripts"
           python3 "$SCRIPT_DIR/fix-sarif-uris.py" "$SARIF_FILE"
           echo "SARIF written to $SARIF_FILE"
