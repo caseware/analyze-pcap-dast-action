@@ -156,7 +156,8 @@ jobs:
           ARTIFACT="dogfood-$(date +%Y%m%dT%H%M%SZ)"
           tar -czf "$CAPTURE_DIR/$ARTIFACT.tar.gz" -C "$BUNDLE_DIR" .
 
-          DATE_PARTITION=$(date -u +%Y/%m/%d)
+          # Upload to yesterday's partition (action looks back at previous days)
+          DATE_PARTITION=$(date -u -d "1 day ago" +%Y/%m/%d)
           aws s3 cp "$CAPTURE_DIR/$ARTIFACT.tar.gz" \
             "s3://test-pcap/pcap-captures/$DATE_PARTITION/$ARTIFACT.tar.gz" \
             --endpoint-url http://localhost:9000
