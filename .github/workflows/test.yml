@@ -69,8 +69,8 @@ jobs:
 
       - name: Install mitmproxy
         run: |
-          pip install --quiet mitmproxy==11.1.3 2>/dev/null || \
-            pip install --quiet --break-system-packages mitmproxy==11.1.3
+          pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
+            pip install --quiet --break-system-packages mitmproxy==11.0.2
 
       - name: Start MinIO (S3-compatible storage)
         run: |
