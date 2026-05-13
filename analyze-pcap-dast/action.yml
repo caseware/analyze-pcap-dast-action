@@ -1,0 +1,172 @@
+name: 'Analyze PCAP with DAST (Passive)'
+description: |
+  Runs OWASP ZAP in passive scan mode against a HAR file (from
+  create-passive-dast-map or any HAR source) and uploads SARIF results
+  to GitHub Security.
+
+  Supports:
+    - ZAP passive scan via Automation Framework
+    - SARIF output for GitHub Code Scanning
+    - Configurable alert thresholds
+author: 'CaseWare'
+
+inputs:
+  har-file:
+    description: 'Path to the HAR file to analyze.'
+    required: true
+  sarif-file:
+    description: 'Path to write the SARIF output.'
+    required: false
+    default: '${{ runner.temp }}/zap-results.sarif'
+  fail-on-risk:
+    description: 'Fail the action if alerts at or above this risk level are found (none, low, medium, high). Default: none (never fail).'
+    required: false
+    default: 'none'
+  zap-docker-image:
+    description: 'ZAP Docker image to use.'
+    required: false
+    default: 'ghcr.io/zaproxy/zaproxy:stable'
+  upload-sarif:
+    description: 'Upload SARIF to GitHub Security tab (requires security-events: write).'
+    required: false
+    default: 'true'
+  target-url:
+    description: 'Target URL for ZAP context (used for SARIF metadata). If empty, derived from HAR.'
+    required: false
+    default: ''
+
+outputs:
+  sarif-file:
+    description: 'Path to the SARIF results file.'
+    value: ${{ steps.scan.outputs.sarif-file }}
+  alert-count:
+    description: 'Total number of alerts found.'
+    value: ${{ steps.scan.outputs.alert-count }}
+  high-count:
+    description: 'Number of high-risk alerts.'
+    value: ${{ steps.scan.outputs.high-count }}
+  medium-count:
+    description: 'Number of medium-risk alerts.'
+    value: ${{ steps.scan.outputs.medium-count }}
+  low-count:
+    description: 'Number of low-risk alerts.'
+    value: ${{ steps.scan.outputs.low-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare ZAP automation plan
+      id: prepare
+      shell: bash
+      env:
+        HAR_FILE: ${{ inputs.har-file }}
+        SARIF_FILE: ${{ inputs.sarif-file }}
+        ZAP_RULES_CONFIG: ${{ inputs.zap-rules-config }}
+        TARGET_URL: ${{ inputs.target-url }}
+      run: |
+        set -euo pipefail
+        WORK_DIR="${RUNNER_TEMP:-/tmp}/zap-work"
+        mkdir -p "$WORK_DIR"
+
+        if [ ! -f "$HAR_FILE" ]; then
+          echo "::error::HAR file not found: $HAR_FILE"
+          exit 1
+        fi
+
+        # Copy HAR to work dir so Docker can mount it
+        cp "$HAR_FILE" "$WORK_DIR/input.har"
+
+        # Generate ZAP plan via external script (avoids YAML-in-YAML issues)
+        SCRIPT_DIR="${{ github.action_path }}/../scripts"
+        export WORK_DIR
+        export HAR_FILE
+        export TARGET_URL
+        python3 "$SCRIPT_DIR/generate-zap-plan.py" | tee /dev/stderr | \
+          grep '^target-url=' >> "$GITHUB_OUTPUT" || true
+
+        echo "work-dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+
+    - name: Run ZAP passive scan
+      id: scan
+      shell: bash
+      env:
+        WORK_DIR: ${{ steps.prepare.outputs.work-dir }}
+        SARIF_FILE: ${{ inputs.sarif-file }}
+        FAIL_ON_RISK: ${{ inputs.fail-on-risk }}
+        ZAP_IMAGE: ${{ inputs.zap-docker-image }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Running ZAP passive scan"
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$WORK_DIR:/zap/wrk:rw" \
+          "$ZAP_IMAGE" \
+          zap.sh -cmd \
+            -addonupdate \
+            -addoninstall exim \
+            -addoninstall reports \
+            -autorun /zap/wrk/zap-plan.yaml \
+          || ZAP_EXIT=$?
+        echo "::endgroup::"
+
+        ZAP_EXIT=${ZAP_EXIT:-0}
+        echo "ZAP exit code: $ZAP_EXIT"
+
+        # Find the SARIF output
+        ZAP_SARIF="$WORK_DIR/results.sarif"
+        if [ ! -f "$ZAP_SARIF" ]; then
+          # ZAP may append .json
+          ZAP_SARIF="$WORK_DIR/results.json"
+        fi
+
+        if [ -f "$ZAP_SARIF" ]; then
+          cp "$ZAP_SARIF" "$SARIF_FILE"
+          # Fix https:// URIs for GitHub Code Scanning compatibility
+          SCRIPT_DIR="${{ github.action_path }}/../scripts"
+          python3 "$SCRIPT_DIR/fix-sarif-uris.py" "$SARIF_FILE"
+          echo "SARIF written to $SARIF_FILE"
+        else
+          echo "::warning::ZAP did not produce SARIF output"
+          # Create minimal empty SARIF
+          printf '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"ZAP","version":"0.0.0","rules":[]}},"results":[]}]}' > "$SARIF_FILE"
+        fi
+
+        echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"
+
+        # Count alerts by risk
+        SCRIPT_DIR="${{ github.action_path }}/../scripts"
+        COUNTS=$(python3 "$SCRIPT_DIR/count-sarif-alerts.py" "$SARIF_FILE" 2>/dev/null || echo "0 0 0 0")
+
+        TOTAL=$(echo "$COUNTS" | awk '{print $1}')
+        HIGH=$(echo "$COUNTS" | awk '{print $2}')
+        MEDIUM=$(echo "$COUNTS" | awk '{print $3}')
+        LOW=$(echo "$COUNTS" | awk '{print $4}')
+
+        echo "alert-count=$TOTAL" >> "$GITHUB_OUTPUT"
+        echo "high-count=$HIGH" >> "$GITHUB_OUTPUT"
+        echo "medium-count=$MEDIUM" >> "$GITHUB_OUTPUT"
+        echo "low-count=$LOW" >> "$GITHUB_OUTPUT"
+
+        echo "::notice::ZAP passive scan: $TOTAL alerts (high=$HIGH, medium=$MEDIUM, low=$LOW)"
+
+        # Check fail threshold
+        FAIL=0
+        case "$FAIL_ON_RISK" in
+          high)   [ "$HIGH" -gt 0 ] && FAIL=1 ;;
+          medium) [ "$HIGH" -gt 0 ] || [ "$MEDIUM" -gt 0 ] && FAIL=1 ;;
+          low)    [ "$TOTAL" -gt 0 ] && FAIL=1 ;;
+          none|*) ;;
+        esac
+
+        if [ "$FAIL" -eq 1 ]; then
+          echo "::error::ZAP found alerts at or above '$FAIL_ON_RISK' risk level"
+          exit 1
+        fi
+
+    - name: Upload SARIF to GitHub Security
+      if: ${{ inputs.upload-sarif == 'true' && always() }}
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: 'dast-passive'
