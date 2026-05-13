@@ -23,7 +23,7 @@ inputs:
     required: false
     default: ''
   days:
-    description: 'Look back this many full UTC days for PCAP bundles (default 1 = today only).'
+    description: 'Look back this many full UTC days for PCAP bundles (default 1 = yesterday only).'
     required: false
     default: '1'
   output-dir:
@@ -70,8 +70,8 @@ runs:
     - name: Install Python dependencies
       shell: bash
       run: |
-        pip install --quiet mitmproxy==11.1.3 2>/dev/null || \
-          pip install --quiet --break-system-packages mitmproxy==11.1.3
+        pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
+          pip install --quiet --break-system-packages mitmproxy==11.0.2
 
     - name: Download and extract PCAP bundles from S3
       id: download
@@ -95,7 +95,7 @@ runs:
         unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy 2>/dev/null || true
 
         BUNDLE_COUNT=0
-        for i in $(seq 0 $((DAYS - 1))); do
+        for i in $(seq 1 $DAYS); do
           DATE_PREFIX=$(date -u -d "$i days ago" +%Y/%m/%d 2>/dev/null || \
                         date -u -v-${i}d +%Y/%m/%d)
           S3_PATH="s3://$S3_BUCKET/$S3_PREFIX/$DATE_PREFIX/"
