@@ -53,8 +53,12 @@ jobs:
   # a site map, run ZAP passive scan, and upload SARIF to Security tab
   # ───────────────────────────────────────────────────────────────────
   test-dogfood:
-    name: "Dogfood: capture & analyze github.com"
+    name: "Dogfood: capture & analyze github.com (${{ matrix.proxy-tool }})"
     runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        proxy-tool: [fluxzy, mitmproxy]
     permissions:
       contents: read
       security-events: write
@@ -68,11 +72,16 @@ jobs:
           python-version: '3.12'
 
       - name: Install mitmproxy
+        if: matrix.proxy-tool == 'mitmproxy'
         run: |
           pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
             pip install --quiet --break-system-packages mitmproxy==11.0.2
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
+
+      - name: Install Fluxzy
+        if: matrix.proxy-tool == 'fluxzy'
+        run: npm install -g @fluxzy/cli
 
       - name: Start MinIO (S3-compatible storage)
         run: |
@@ -98,27 +107,41 @@ jobs:
 
           aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000
 
-      - name: Capture traffic via mitmproxy
+      - name: Capture traffic via selected proxy
+        env:
+          PROXY_TOOL: ${{ matrix.proxy-tool }}
         run: |
           set -euo pipefail
           CAPTURE_DIR="${RUNNER_TEMP}/capture"
           mkdir -p "$CAPTURE_DIR/.mitmproxy"
+          mkdir -p "$CAPTURE_DIR/.fluxzy"
 
           export SSLKEYLOGFILE="$CAPTURE_DIR/sslkeys.log"
 
-          # Start mitmproxy
-          mitmdump \
-            --mode regular \
-            --listen-port 8080 \
-            --set confdir="$CAPTURE_DIR/.mitmproxy" \
-            --set ssl_insecure=true \
-            --save-stream-file "$CAPTURE_DIR/mitmproxy-flows" \
-            --quiet &
-          MITM_PID=$!
-          echo "$MITM_PID" > "$CAPTURE_DIR/mitmdump.pid"
-          sleep 3
+          if [ "$PROXY_TOOL" = "fluxzy" ]; then
+            npx --yes @fluxzy/cli cert export "$CAPTURE_DIR/.fluxzy/fluxzy-ca.crt"
+            fluxzy start \
+              -l "127.0.0.1:8080" \
+              -k \
+              -o "$CAPTURE_DIR/fluxzy-capture.har" \
+              > "$CAPTURE_DIR/fluxzy-stdout.log" 2>&1 &
+            PROXY_PID=$!
+            echo "$PROXY_PID" > "$CAPTURE_DIR/fluxzy.pid"
+            CA_CERT="$CAPTURE_DIR/.fluxzy/fluxzy-ca.crt"
+          else
+            mitmdump \
+              --mode regular \
+              --listen-port 8080 \
+              --set confdir="$CAPTURE_DIR/.mitmproxy" \
+              --set ssl_insecure=true \
+              --save-stream-file "$CAPTURE_DIR/mitmproxy-flows" \
+              --quiet &
+            PROXY_PID=$!
+            echo "$PROXY_PID" > "$CAPTURE_DIR/mitmdump.pid"
+            CA_CERT="$CAPTURE_DIR/.mitmproxy/mitmproxy-ca-cert.pem"
+          fi
 
-          CA_CERT="$CAPTURE_DIR/.mitmproxy/mitmproxy-ca-cert.pem"
+          sleep 3
 
           # Make requests through the proxy to this repo's GitHub page
           export http_proxy=http://127.0.0.1:8080
@@ -142,15 +165,15 @@ jobs:
 
           unset http_proxy https_proxy
 
-          # Stop mitmproxy
-          kill "$MITM_PID" 2>/dev/null || true
+          # Stop proxy
+          kill "$PROXY_PID" 2>/dev/null || true
           sleep 2
-          kill -9 "$MITM_PID" 2>/dev/null || true
+          kill -9 "$PROXY_PID" 2>/dev/null || true
 
           # Bundle and upload to MinIO
           BUNDLE_DIR="$CAPTURE_DIR/bundle"
           mkdir -p "$BUNDLE_DIR"
-          for f in mitmproxy-flows sslkeys.log; do
+          for f in mitmproxy-flows fluxzy-capture.har sslkeys.log; do
             [ -f "$CAPTURE_DIR/$f" ] && cp "$CAPTURE_DIR/$f" "$BUNDLE_DIR/"
           done
           [ -f "$CA_CERT" ] && cp "$CA_CERT" "$BUNDLE_DIR/"
