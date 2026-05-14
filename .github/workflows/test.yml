@@ -165,13 +165,25 @@ jobs:
         run: |
           set -euo pipefail
           echo "Waiting for MinIO..."
+          READY=false
           for i in $(seq 1 60); do
             if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
               echo "MinIO is ready"
+              READY=true
               break
             fi
             sleep 1
           done
+
+          if [ "$READY" != "true" ]; then
+            echo "::error::MinIO did not become ready within 60 seconds"
+            if [ -f "$RUNNER_TEMP/minio.log" ]; then
+              echo "::group::MinIO log"
+              tail -200 "$RUNNER_TEMP/minio.log" || true
+              echo "::endgroup::"
+            fi
+            exit 1
+          fi
 
       - name: Configure AWS CLI for MinIO
         shell: bash
@@ -180,7 +192,9 @@ jobs:
           aws configure set aws_access_key_id minioadmin
           aws configure set aws_secret_access_key minioadmin
           aws configure set default.region us-east-1
-          aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000 || true
+          if ! aws s3 ls s3://test-pcap --endpoint-url http://localhost:9000 >/dev/null 2>&1; then
+            aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000
+          fi
 
       - name: Capture traffic via selected proxy
         shell: bash
