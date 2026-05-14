@@ -92,10 +92,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --quiet mitmproxy==11.0.2
-          SCRIPTS_DIR="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
-          echo "$SCRIPTS_DIR" >> "$GITHUB_PATH"
-          export PATH="$SCRIPTS_DIR:$PATH"
+          MITM_VENV="$RUNNER_TEMP/mitmproxy-venv"
+          python -m venv "$MITM_VENV"
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            VENV_BIN="$MITM_VENV/Scripts"
+            VENV_PY="$VENV_BIN/python.exe"
+          else
+            VENV_BIN="$MITM_VENV/bin"
+            VENV_PY="$VENV_BIN/python"
+          fi
+
+          "$VENV_PY" -m pip install --upgrade pip
+          "$VENV_PY" -m pip install --quiet mitmproxy==11.0.2
+
+          echo "$VENV_BIN" >> "$GITHUB_PATH"
+          export PATH="$VENV_BIN:$PATH"
 
       - name: Install Fluxzy
         if: matrix.proxy-tool == 'fluxzy'
@@ -293,6 +305,7 @@ jobs:
           days: '1'
 
       - name: Export site map paths
+        shell: bash
         env:
           HAR_FILE: ${{ steps.sitemap.outputs.har-file }}
           URL_LIST: ${{ steps.sitemap.outputs.url-list }}
@@ -357,6 +370,7 @@ jobs:
           [ "$URL_COUNT" -gt 0 ] || { echo "::error::Burp XML has 0 URLs"; exit 1; }
 
       - name: Run DAST passive analysis
+        if: runner.os == 'Linux'
         uses: ./analyze-pcap-dast
         id: dast
         with:
@@ -365,6 +379,7 @@ jobs:
           upload-sarif: 'true'
 
       - name: Verify DAST outputs
+        if: runner.os == 'Linux'
         shell: bash
         env:
           SARIF_FILE: ${{ steps.dast.outputs.sarif-file }}

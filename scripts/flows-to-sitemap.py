@@ -329,7 +329,12 @@ def _har_entry_to_burp_item(entry: dict[str, Any]) -> ET.Element:
         path = f"{path}?{parsed.query}"
 
     item = ET.Element("item")
-    ET.SubElement(item, "time").text = datetime.now(tz=timezone.utc).strftime("%a %b %d %H:%M:%S UTC %Y")
+    started_dt = entry.get("startedDateTime") or datetime.now(tz=timezone.utc).isoformat()
+    try:
+        dt = datetime.fromisoformat(started_dt.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        dt = datetime.now(tz=timezone.utc)
+    ET.SubElement(item, "time").text = dt.strftime("%a %b %d %H:%M:%S UTC %Y")
     ET.SubElement(item, "url").text = url
     ET.SubElement(item, "host").text = parsed.hostname or ""
     ET.SubElement(item, "port").text = str(parsed.port or (443 if parsed.scheme == "https" else 80))
