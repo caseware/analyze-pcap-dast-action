@@ -225,10 +225,12 @@ jobs:
             "$FLUXZY_BIN" --yes @fluxzy/cli cert export "$FLUXZY_DIR/fluxzy-ca.crt"
             CA_CERT="$FLUXZY_DIR/fluxzy-ca.crt"
             CAPTURE_FILE="$CAPTURE_DIR/fluxzy-capture.har"
+            FLUXZY_DUMP_DIR="$CAPTURE_DIR/fluxzy-dump"
+            mkdir -p "$FLUXZY_DUMP_DIR"
             "$FLUXZY_BIN" @fluxzy/cli start \
               -l "127.0.0.1:8080" \
               -k \
-              -o "$CAPTURE_FILE" \
+              -d "$FLUXZY_DUMP_DIR" \
               > "$CAPTURE_DIR/fluxzy-stdout.log" 2>&1 &
           else
             CAPTURE_FILE="$CAPTURE_DIR/mitmproxy-flows"
@@ -258,6 +260,11 @@ jobs:
 
           cleanup
           trap - EXIT
+
+          # Generate HAR from Fluxzy dump if needed
+          if [ "$PROXY_TOOL" = "fluxzy" ] && [ -d "$FLUXZY_DUMP_DIR" ]; then
+            "$FLUXZY_BIN" @fluxzy/cli pack "$FLUXZY_DUMP_DIR" "$CAPTURE_FILE"
+          fi
 
           for i in $(seq 1 10); do
             if [ -f "$CAPTURE_FILE" ] && [ -s "$CAPTURE_FILE" ]; then
