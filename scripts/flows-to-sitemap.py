@@ -1,4 +1,4 @@
-"""Convert mitmproxy flow files to DAST-compatible site maps.
+"""Convert captured HTTP exchanges to DAST-compatible site maps.
 
 Outputs:
   - sitemap.har   (HAR 1.2 — ZAP, Burp Suite, Rapid7, Chrome DevTools)
@@ -21,10 +21,16 @@ import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 from xml.dom import minidom
 
-from mitmproxy import io as mio
-from mitmproxy.http import HTTPFlow
+try:
+    from mitmproxy import io as mio
+    from mitmproxy.http import HTTPFlow
+except ImportError:
+    mio = None
+    HTTPFlow = Any
 
 
 def _read_version() -> str:
@@ -75,6 +81,27 @@ def _should_include(
     if status_codes and (not flow.response or flow.response.status_code not in status_codes):
         return False
     if methods and flow.request.method.upper() not in methods:
+        return False
+    return True
+
+
+def _should_include_values(
+    *,
+    host: str,
+    status_code: int,
+    method: str,
+    domain_allow: list[str],
+    domain_deny: list[str],
+    status_codes: list[int],
+    methods: list[str],
+) -> bool:
+    if domain_allow and not _glob_match(host, domain_allow):
+        return False
+    if domain_deny and _glob_match(host, domain_deny):
+        return False
+    if status_codes and status_code not in status_codes:
+        return False
+    if methods and method.upper() not in methods:
         return False
     return True
 
@@ -229,9 +256,131 @@ def _flow_to_burp_item(flow: HTTPFlow) -> ET.Element:
     return item
 
 
+def _har_header_list(headers: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    if not headers:
+        return []
+    return [
+        {"name": str(h.get("name", "")), "value": str(h.get("value", ""))}
+        for h in headers
+    ]
+
+
+def _har_entry_to_har_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    started = entry.get("startedDateTime") or datetime.now(tz=timezone.utc).isoformat()
+    request = entry.get("request") or {}
+    response = entry.get("response") or {}
+
+    req_body = ((request.get("postData") or {}).get("text") or "").encode("utf-8", errors="ignore")
+    resp_text = ((response.get("content") or {}).get("text") or "")
+
+    return {
+        "startedDateTime": started,
+        "time": int(entry.get("time") or 0),
+        "request": {
+            "method": request.get("method", "GET"),
+            "url": request.get("url", ""),
+            "httpVersion": request.get("httpVersion", "HTTP/1.1"),
+            "cookies": request.get("cookies") or [],
+            "headers": _har_header_list(request.get("headers")),
+            "queryString": request.get("queryString") or [],
+            "headersSize": int(request.get("headersSize") or 0),
+            "bodySize": int(request.get("bodySize") or len(req_body)),
+            **(
+                {
+                    "postData": {
+                        "mimeType": (request.get("postData") or {}).get("mimeType", ""),
+                        "text": (request.get("postData") or {}).get("text", ""),
+                    }
+                }
+                if request.get("postData")
+                else {}
+            ),
+        },
+        "response": {
+            "status": int(response.get("status") or 0),
+            "statusText": response.get("statusText", ""),
+            "httpVersion": response.get("httpVersion", "HTTP/1.1"),
+            "cookies": response.get("cookies") or [],
+            "headers": _har_header_list(response.get("headers")),
+            "content": {
+                "size": int((response.get("content") or {}).get("size") or len(resp_text.encode("utf-8", errors="ignore"))),
+                "mimeType": (response.get("content") or {}).get("mimeType", ""),
+                "text": resp_text,
+            },
+            "redirectURL": response.get("redirectURL", ""),
+            "headersSize": int(response.get("headersSize") or 0),
+            "bodySize": int(response.get("bodySize") or 0),
+        },
+        "cache": entry.get("cache") or {},
+        "timings": entry.get("timings") or {"send": 0, "wait": int(entry.get("time") or 0), "receive": 0},
+    }
+
+
+def _har_entry_to_burp_item(entry: dict[str, Any]) -> ET.Element:
+    request = entry.get("request") or {}
+    response = entry.get("response") or {}
+    content = response.get("content") or {}
+
+    url = str(request.get("url", ""))
+    parsed = urlparse(url)
+    method = str(request.get("method", "GET"))
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    item = ET.Element("item")
+    ET.SubElement(item, "time").text = datetime.now(tz=timezone.utc).strftime("%a %b %d %H:%M:%S UTC %Y")
+    ET.SubElement(item, "url").text = url
+    ET.SubElement(item, "host").text = parsed.hostname or ""
+    ET.SubElement(item, "port").text = str(parsed.port or (443 if parsed.scheme == "https" else 80))
+    ET.SubElement(item, "protocol").text = parsed.scheme or "https"
+    ET.SubElement(item, "method").text = method
+    ET.SubElement(item, "path").text = path
+    ET.SubElement(item, "extension").text = (
+        path.rsplit(".", 1)[-1][:10] if "." in path.split("?")[0] else ""
+    )
+
+    raw_req = method + " " + path + " " + str(request.get("httpVersion", "HTTP/1.1")) + "\r\n"
+    for h in _har_header_list(request.get("headers")):
+        raw_req += h["name"] + ": " + h["value"] + "\r\n"
+    raw_req += "\r\n"
+    post_data = request.get("postData") or {}
+    if post_data.get("text"):
+        raw_req += str(post_data["text"])
+
+    req_el = ET.SubElement(item, "request")
+    req_el.set("base64", "true")
+    req_el.text = base64.b64encode(raw_req.encode()).decode()
+
+    status = int(response.get("status") or 0)
+    ET.SubElement(item, "status").text = str(status)
+    ET.SubElement(item, "responselength").text = str(int(response.get("bodySize") or content.get("size") or 0))
+    ET.SubElement(item, "mimetype").text = str(content.get("mimeType") or "")
+
+    raw_resp = (
+        str(response.get("httpVersion", "HTTP/1.1"))
+        + " "
+        + str(status)
+        + " "
+        + str(response.get("statusText", ""))
+        + "\r\n"
+    )
+    for h in _har_header_list(response.get("headers")):
+        raw_resp += h["name"] + ": " + h["value"] + "\r\n"
+    raw_resp += "\r\n"
+    if content.get("text"):
+        raw_resp += str(content["text"])
+
+    resp_el = ET.SubElement(item, "response")
+    resp_el.set("base64", "true")
+    resp_el.text = base64.b64encode(raw_resp.encode()).decode()
+    ET.SubElement(item, "comment")
+    return item
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert mitmproxy flows to DAST site maps"
+        description="Convert captured exchanges to DAST site maps"
     )
     parser.add_argument("--flows-dir", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -256,13 +405,19 @@ def main() -> None:
     seen: set[str] = set()
 
     flow_files = sorted(flows_dir.glob("*.flows"))
-    if not flow_files:
-        print("::warning::No mitmproxy flow files found in " + str(flows_dir))
+    har_files = sorted(flows_dir.glob("*.har"))
+    if not flow_files and not har_files:
+        print("::warning::No capture files found in " + str(flows_dir))
 
     total = 0
     kept = 0
     dupes = 0
     for flow_file in flow_files:
+        if mio is None:
+            raise RuntimeError(
+                "mitmproxy is required to parse .flows files but is not installed"
+            )
+
         print(f"Processing {flow_file.name}")
         with open(flow_file, "rb") as f:
             reader = mio.FlowReader(f)
@@ -296,6 +451,48 @@ def main() -> None:
                 har_entries.append(_flow_to_har_entry(flow))
                 urls.add(flow.request.pretty_url)
                 burp_items.append(_flow_to_burp_item(flow))
+
+    for har_file in har_files:
+        print(f"Processing {har_file.name}")
+        with open(har_file, "r", encoding="utf-8") as f:
+            har_data = json.load(f)
+
+        entries = ((har_data.get("log") or {}).get("entries") or [])
+        for entry in entries:
+            request = entry.get("request") or {}
+            response = entry.get("response") or {}
+            request_url = str(request.get("url") or "")
+            parsed = urlparse(request_url)
+            host = parsed.hostname or ""
+            method = str(request.get("method") or "GET").upper()
+            status_code = int(response.get("status") or 0)
+
+            total += 1
+            if not _should_include_values(
+                host=host,
+                status_code=status_code,
+                method=method,
+                domain_allow=domain_allow,
+                domain_deny=domain_deny,
+                status_codes=status_codes,
+                methods=methods,
+            ):
+                continue
+
+            post_data = request.get("postData") or {}
+            body_hash = hashlib.sha256(
+                str(post_data.get("text") or "").encode("utf-8", errors="ignore")
+            ).hexdigest()[:16]
+            dedup_key = f"{method}\0{request_url}\0{body_hash}"
+            if dedup_key in seen:
+                dupes += 1
+                continue
+            seen.add(dedup_key)
+
+            kept += 1
+            har_entries.append(_har_entry_to_har_entry(entry))
+            urls.add(request_url)
+            burp_items.append(_har_entry_to_burp_item(entry))
 
     print(f"Processed {total} flows, kept {kept}, "
           f"deduplicated {dupes}")

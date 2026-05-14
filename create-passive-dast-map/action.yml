@@ -1,8 +1,8 @@
 name: 'Create Passive DAST Site Map'
 description: |
   Downloads PCAP bundles from date-partitioned S3 prefixes (last N full UTC days),
-  extracts mitmproxy flows, and generates site maps compatible with ZAP, Burp Suite,
-  and Rapid7.
+  extracts captured HTTP exchanges, and generates site maps compatible with ZAP,
+  Burp Suite, and Rapid7.
 
   Output formats:
     - HAR (HTTP Archive 1.2) — universal, works with ZAP/Burp/Rapid7
@@ -67,14 +67,6 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Install Python dependencies
-      shell: bash
-      run: |
-        pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
-          pip install --quiet --break-system-packages mitmproxy==11.0.2
-        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-        export PATH="$HOME/.local/bin:$PATH"
-
     - name: Download and extract PCAP bundles from S3
       id: download
       shell: bash
@@ -123,14 +115,31 @@ runs:
                  "$OUTPUT_DIR/flows/${BUNDLE_NAME}.flows"
               BUNDLE_COUNT=$((BUNDLE_COUNT + 1))
             fi
+
+            if [ -f "$BUNDLE_DIR/fluxzy-capture.har" ]; then
+              cp "$BUNDLE_DIR/fluxzy-capture.har" \
+                 "$OUTPUT_DIR/flows/${BUNDLE_NAME}.har"
+              BUNDLE_COUNT=$((BUNDLE_COUNT + 1))
+            fi
           done
         done
 
         echo "Downloaded $BUNDLE_COUNT bundles with flow files"
         ls -la "$OUTPUT_DIR/flows/" 2>/dev/null || echo "(no flows found)"
+        FLOW_FILE_COUNT=$(find "$OUTPUT_DIR/flows" -maxdepth 1 -type f -name '*.flows' | wc -l | tr -d ' ')
+        echo "flow-file-count=$FLOW_FILE_COUNT" >> "$GITHUB_OUTPUT"
         echo "output-dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
 
-    - name: Generate site maps from mitmproxy flows
+    - name: Install Python dependencies for mitmproxy flow parsing
+      if: steps.download.outputs.flow-file-count != '0'
+      shell: bash
+      run: |
+        pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
+          pip install --quiet --break-system-packages mitmproxy==11.0.2
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
+
+    - name: Generate site maps from captured exchanges
       id: generate
       shell: bash
       env:
@@ -139,8 +148,8 @@ runs:
         FILTER_EXCLUDE_DOMAINS: ${{ inputs.filter-exclude-domains }}
         FILTER_STATUS_CODES: ${{ inputs.filter-status-codes }}
         FILTER_METHODS: ${{ inputs.filter-methods }}
+        SCRIPT_DIR: ${{ github.action_path }}/../scripts
       run: |
-        SCRIPT_DIR="${{ github.action_path }}/../scripts"
         python3 "$SCRIPT_DIR/flows-to-sitemap.py" \
           --flows-dir "$OUTPUT_DIR/flows" \
           --output-dir "$OUTPUT_DIR" \

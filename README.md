@@ -6,7 +6,7 @@ Uses the output from [capture-pcap-action](https://github.com/caseware/capture-p
 
 ### `create-passive-dast-map`
 
-Downloads PCAP bundles from date-partitioned S3 prefixes (last N full UTC days), extracts mitmproxy flow files, and generates site maps in three formats:
+Downloads capture bundles from date-partitioned S3 prefixes (last N full UTC days), auto-detects mitmproxy flow files and Fluxzy HAR captures, and generates site maps in three formats:
 
 | Format | File | Compatible With |
 |--------|------|-----------------|
@@ -39,7 +39,7 @@ Downloads PCAP bundles from date-partitioned S3 prefixes (last N full UTC days),
 | `filter-methods` | No | — | HTTP methods to include |
 
 > **Note:** Content-type filtering is applied upstream by `capture-pcap-action`'s
-> inline mitmproxy addon (`filter-content-types` input). Flows that reach S3
+> selected proxy capture path (`filter-content-types` input). Capture data that reaches S3
 > have already been filtered, so a duplicate content-type filter is not needed here.
 
 #### Outputs
@@ -138,7 +138,7 @@ jobs:
 
 All workflows run on `ubuntu-24.04-arm` (ARM64-first). The repo dogfoods both actions by capturing traffic to its own GitHub.com page and analyzing it with ZAP.
 
-- **Integration test** — captures HTTPS traffic via mitmproxy, generates site maps, runs ZAP passive scan, uploads SARIF
+- **Integration test** — captures HTTPS traffic via the capture action, generates site maps, runs ZAP passive scan, uploads SARIF
 - **CodeQL** — scans Python and Actions YAML via `caseware/codeql-arm64-compat`
 - **Commitlint** — enforces Conventional Commits
 
