@@ -53,11 +53,27 @@ jobs:
   # a site map, run ZAP passive scan, and upload SARIF to Security tab
   # ───────────────────────────────────────────────────────────────────
   test-dogfood:
-    name: "Dogfood: capture & analyze github.com (${{ matrix.proxy-tool }})"
-    runs-on: ubuntu-24.04-arm
+    name: "Dogfood: capture & analyze github.com (${{ matrix.platform.label }}, ${{ matrix.proxy-tool }})"
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
+        platform:
+          - label: Linux
+            runner: ubuntu-24.04-arm
+            kind: linux
+          - label: Linux (AMD64)
+            runner: ubuntu-24.04
+            kind: linux
+          - label: Windows
+            runner: windows-2022
+            kind: windows
+          - label: macOS (arm64)
+            runner: macos-26
+            kind: macos
+          - label: macOS (x64)
+            runner: macos-26-intel
+            kind: macos
         proxy-tool: [fluxzy, mitmproxy]
     permissions:
       contents: read
@@ -73,26 +89,71 @@ jobs:
 
       - name: Install mitmproxy
         if: matrix.proxy-tool == 'mitmproxy'
+        shell: bash
         run: |
-          pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
-            pip install --quiet --break-system-packages mitmproxy==11.0.2
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
+          set -euo pipefail
+          python -m pip install --quiet mitmproxy==11.0.2
+          SCRIPTS_DIR="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
+          echo "$SCRIPTS_DIR" >> "$GITHUB_PATH"
+          export PATH="$SCRIPTS_DIR:$PATH"
 
       - name: Install Fluxzy
         if: matrix.proxy-tool == 'fluxzy'
         run: npm install -g @fluxzy/cli
 
-      - name: Start MinIO (S3-compatible storage)
+      - name: Start MinIO
+        shell: bash
         run: |
-          docker run -d --name minio \
-            -p 9000:9000 -p 9001:9001 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-06-13T11-33-47Z server /data --console-address ":9001"
+          set -euo pipefail
+          MINIO_DATA="$RUNNER_TEMP/minio-data"
+          mkdir -p "$MINIO_DATA"
 
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64) ARCH_TAG="amd64" ;;
+            arm64|aarch64) ARCH_TAG="arm64" ;;
+            *)
+              echo "::error::Unsupported architecture for MinIO: $ARCH"
+              exit 1
+              ;;
+          esac
+
+          case "$RUNNER_OS" in
+            Linux)
+              MINIO_URL="https://dl.min.io/server/minio/release/linux-${ARCH_TAG}/minio"
+              MINIO_BIN="$RUNNER_TEMP/minio"
+              ;;
+            macOS)
+              MINIO_URL="https://dl.min.io/server/minio/release/darwin-${ARCH_TAG}/minio"
+              MINIO_BIN="$RUNNER_TEMP/minio"
+              ;;
+            Windows)
+              MINIO_URL="https://dl.min.io/server/minio/release/windows-amd64/minio.exe"
+              MINIO_BIN="$RUNNER_TEMP/minio.exe"
+              ;;
+            *)
+              echo "::error::Unsupported runner OS for MinIO: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+
+          echo "Downloading MinIO from: $MINIO_URL"
+          curl -fsSL "$MINIO_URL" -o "$MINIO_BIN"
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            chmod +x "$MINIO_BIN"
+          fi
+
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            "$MINIO_BIN" server "$MINIO_DATA" --address ":9000" --console-address ":9001" \
+            > "$RUNNER_TEMP/minio.log" 2>&1 &
+          echo "MINIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for MinIO
+        shell: bash
+        run: |
+          set -euo pipefail
           echo "Waiting for MinIO..."
-          for i in $(seq 1 30); do
+          for i in $(seq 1 60); do
             if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
               echo "MinIO is ready"
               break
@@ -100,77 +161,110 @@ jobs:
             sleep 1
           done
 
-          # Configure AWS CLI for MinIO
+      - name: Configure AWS CLI for MinIO
+        shell: bash
+        run: |
+          set -euo pipefail
           aws configure set aws_access_key_id minioadmin
           aws configure set aws_secret_access_key minioadmin
           aws configure set default.region us-east-1
-
-          aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000
+          aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000 || true
 
       - name: Capture traffic via selected proxy
+        shell: bash
         env:
           PROXY_TOOL: ${{ matrix.proxy-tool }}
         run: |
           set -euo pipefail
-          CAPTURE_DIR="${RUNNER_TEMP}/capture"
-          mkdir -p "$CAPTURE_DIR/.mitmproxy"
-          mkdir -p "$CAPTURE_DIR/.fluxzy"
+          PROXY_PID=""
+          cleanup() {
+            if [ -n "${PROXY_PID:-}" ]; then
+              kill -TERM "$PROXY_PID" 2>/dev/null || true
+              for i in $(seq 1 10); do
+                if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+                  return
+                fi
+                sleep 1
+              done
+              kill -9 "$PROXY_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
 
+          CAPTURE_DIR="${RUNNER_TEMP}/capture"
+          MITM_DIR="$CAPTURE_DIR/.mitmproxy"
+          FLUXZY_DIR="$CAPTURE_DIR/.fluxzy"
+          mkdir -p "$MITM_DIR" "$FLUXZY_DIR"
           export SSLKEYLOGFILE="$CAPTURE_DIR/sslkeys.log"
 
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            FLUXZY_BIN="npx.cmd"
+            CURL_BIN="curl.exe"
+            NULL_OUT="NUL"
+            USE_CACERT="false"
+          else
+            FLUXZY_BIN="npx"
+            CURL_BIN="curl"
+            NULL_OUT="/dev/null"
+            USE_CACERT="true"
+          fi
+
           if [ "$PROXY_TOOL" = "fluxzy" ]; then
-            npx --yes @fluxzy/cli cert export "$CAPTURE_DIR/.fluxzy/fluxzy-ca.crt"
-            fluxzy start \
+            "$FLUXZY_BIN" --yes @fluxzy/cli cert export "$FLUXZY_DIR/fluxzy-ca.crt"
+            CA_CERT="$FLUXZY_DIR/fluxzy-ca.crt"
+            CAPTURE_FILE="$CAPTURE_DIR/fluxzy-capture.har"
+            "$FLUXZY_BIN" @fluxzy/cli start \
               -l "127.0.0.1:8080" \
               -k \
-              -o "$CAPTURE_DIR/fluxzy-capture.har" \
+              -o "$CAPTURE_FILE" \
               > "$CAPTURE_DIR/fluxzy-stdout.log" 2>&1 &
-            PROXY_PID=$!
-            echo "$PROXY_PID" > "$CAPTURE_DIR/fluxzy.pid"
-            CA_CERT="$CAPTURE_DIR/.fluxzy/fluxzy-ca.crt"
           else
+            CAPTURE_FILE="$CAPTURE_DIR/mitmproxy-flows"
+            CA_CERT="$MITM_DIR/mitmproxy-ca-cert.pem"
             mitmdump \
               --mode regular \
               --listen-port 8080 \
-              --set confdir="$CAPTURE_DIR/.mitmproxy" \
+              --set confdir="$MITM_DIR" \
               --set ssl_insecure=true \
-              --save-stream-file "$CAPTURE_DIR/mitmproxy-flows" \
-              --quiet &
-            PROXY_PID=$!
-            echo "$PROXY_PID" > "$CAPTURE_DIR/mitmdump.pid"
-            CA_CERT="$CAPTURE_DIR/.mitmproxy/mitmproxy-ca-cert.pem"
+              --save-stream-file "$CAPTURE_FILE" \
+              --quiet \
+              > "$CAPTURE_DIR/mitmdump-stdout.log" 2>&1 &
+          fi
+          PROXY_PID=$!
+
+          sleep 4
+
+          if [ "$USE_CACERT" = "true" ]; then
+            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" --cacert "$CA_CERT" "https://github.com/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
+            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" --cacert "$CA_CERT" "https://github.com/caseware" -o "$NULL_OUT" || true
+            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" --cacert "$CA_CERT" "https://api.github.com/repos/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
+          else
+            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" -k "https://github.com/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
+            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" -k "https://github.com/caseware" -o "$NULL_OUT" || true
+            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" -k "https://api.github.com/repos/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
           fi
 
-          sleep 3
+          cleanup
+          trap - EXIT
 
-          # Make requests through the proxy to this repo's GitHub page
-          export http_proxy=http://127.0.0.1:8080
-          export https_proxy=http://127.0.0.1:8080
+          for i in $(seq 1 10); do
+            if [ -f "$CAPTURE_FILE" ] && [ -s "$CAPTURE_FILE" ]; then
+              break
+            fi
+            sleep 1
+          done
 
-          echo "::group::Fetching GitHub pages"
+          if [ ! -f "$CAPTURE_FILE" ]; then
+            echo "::error::Expected capture file missing: $CAPTURE_FILE"
+            ls -la "$CAPTURE_DIR" || true
+            exit 1
+          fi
+          if [ ! -s "$CAPTURE_FILE" ]; then
+            echo "::error::Expected capture file is empty: $CAPTURE_FILE"
+            ls -la "$CAPTURE_DIR" || true
+            exit 1
+          fi
 
-          curl -sS --max-time 30 --cacert "$CA_CERT" \
-            -o /dev/null -w "repo page: HTTP %{http_code}\n" \
-            https://github.com/caseware/analyze-pcap-dast-action || true
-
-          curl -sS --max-time 30 --cacert "$CA_CERT" \
-            -o /dev/null -w "org page: HTTP %{http_code}\n" \
-            https://github.com/caseware || true
-
-          curl -sS --max-time 30 --cacert "$CA_CERT" \
-            -o /dev/null -w "github api: HTTP %{http_code}\n" \
-            https://api.github.com/repos/caseware/analyze-pcap-dast-action || true
-
-          echo "::endgroup::"
-
-          unset http_proxy https_proxy
-
-          # Stop proxy
-          kill "$PROXY_PID" 2>/dev/null || true
-          sleep 2
-          kill -9 "$PROXY_PID" 2>/dev/null || true
-
-          # Bundle and upload to MinIO
           BUNDLE_DIR="$CAPTURE_DIR/bundle"
           mkdir -p "$BUNDLE_DIR"
           for f in mitmproxy-flows fluxzy-capture.har sslkeys.log; do
@@ -178,11 +272,10 @@ jobs:
           done
           [ -f "$CA_CERT" ] && cp "$CA_CERT" "$BUNDLE_DIR/"
 
-          ARTIFACT="dogfood-$(date +%Y%m%dT%H%M%SZ)"
+          ARTIFACT="dogfood-$(date -u +%Y%m%dT%H%M%SZ)"
           tar -czf "$CAPTURE_DIR/$ARTIFACT.tar.gz" -C "$BUNDLE_DIR" .
 
-          # Upload to yesterday's partition (action looks back at previous days)
-          DATE_PARTITION=$(date -u -d "1 day ago" +%Y/%m/%d)
+          DATE_PARTITION=$(python -c "from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc)-timedelta(days=1)).strftime('%Y/%m/%d'))")
           aws s3 cp "$CAPTURE_DIR/$ARTIFACT.tar.gz" \
             "s3://test-pcap/pcap-captures/$DATE_PARTITION/$ARTIFACT.tar.gz" \
             --endpoint-url http://localhost:9000
@@ -199,17 +292,28 @@ jobs:
           s3-endpoint: 'http://localhost:9000'
           days: '1'
 
+      - name: Export site map paths
+        env:
+          HAR_FILE: ${{ steps.sitemap.outputs.har-file }}
+          URL_LIST: ${{ steps.sitemap.outputs.url-list }}
+          BURP_XML: ${{ steps.sitemap.outputs.burp-xml }}
+          URL_COUNT: ${{ steps.sitemap.outputs.url-count }}
+          DOMAIN_COUNT: ${{ steps.sitemap.outputs.domain-count }}
+        run: |
+          echo "HAR_FILE=$HAR_FILE" >> "$GITHUB_ENV"
+          echo "URL_LIST=$URL_LIST" >> "$GITHUB_ENV"
+          echo "BURP_XML=$BURP_XML" >> "$GITHUB_ENV"
+          echo "URL_COUNT=$URL_COUNT" >> "$GITHUB_ENV"
+          echo "DOMAIN_COUNT=$DOMAIN_COUNT" >> "$GITHUB_ENV"
+
       - name: Verify site map outputs
+        shell: bash
         run: |
           set -euo pipefail
           echo "=== HAR ==="
-          if [ -f "${{ steps.sitemap.outputs.har-file }}" ]; then
-            SIZE=$(stat -c%s "${{ steps.sitemap.outputs.har-file }}")
-            ENTRIES=$(python3 -c "
-          import json
-          with open('${{ steps.sitemap.outputs.har-file }}') as f:
-              print(len(json.load(f)['log']['entries']))
-          ")
+          if [ -f "$HAR_FILE" ]; then
+            SIZE=$(python -c "import os; from pathlib import Path; print(Path(os.environ['HAR_FILE']).stat().st_size)")
+            ENTRIES=$(python -c "import json, os; print(len(json.load(open(os.environ['HAR_FILE']))['log']['entries']))")
             echo "HAR: $SIZE bytes, $ENTRIES entries"
             [ "$SIZE" -gt 100 ] || { echo "::error::HAR too small"; exit 1; }
           else
@@ -217,9 +321,9 @@ jobs:
           fi
 
           echo "=== URL list ==="
-          if [ -f "${{ steps.sitemap.outputs.url-list }}" ]; then
-            cat "${{ steps.sitemap.outputs.url-list }}"
-            LINES=$(wc -l < "${{ steps.sitemap.outputs.url-list }}")
+          if [ -f "$URL_LIST" ]; then
+            cat "$URL_LIST"
+            LINES=$(python -c "import os; from pathlib import Path; print(len(Path(os.environ['URL_LIST']).read_text().splitlines()))")
             echo "URLs: $LINES"
             [ "$LINES" -gt 0 ] || { echo "::error::URL list empty"; exit 1; }
           else
@@ -227,33 +331,28 @@ jobs:
           fi
 
           echo "=== Burp XML ==="
-          if [ -f "${{ steps.sitemap.outputs.burp-xml }}" ]; then
-            SIZE=$(stat -c%s "${{ steps.sitemap.outputs.burp-xml }}")
+          if [ -f "$BURP_XML" ]; then
+            SIZE=$(python -c "import os; from pathlib import Path; print(Path(os.environ['BURP_XML']).stat().st_size)")
             echo "Burp XML: $SIZE bytes"
             [ "$SIZE" -gt 100 ] || { echo "::error::Burp XML too small"; exit 1; }
           else
             echo "::error::Burp XML missing"; exit 1
           fi
 
-          echo "URL count: ${{ steps.sitemap.outputs.url-count }}"
-          echo "Domain count: ${{ steps.sitemap.outputs.domain-count }}"
+          echo "URL count: ${URL_COUNT:-n/a}"
+          echo "Domain count: ${DOMAIN_COUNT:-n/a}"
 
       - name: Extract Burp XML statistics
+        shell: bash
+        env:
+          TEMP_DIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          python3 scripts/burp-xml-stats.py \
-            "${{ steps.sitemap.outputs.burp-xml }}" \
-            -o "${{ runner.temp }}/burp-stats.json"
-
+          python scripts/burp-xml-stats.py "$BURP_XML" -o "$TEMP_DIR/burp-stats.json"
           echo "=== Burp XML Stats ==="
-          cat "${{ runner.temp }}/burp-stats.json"
+          cat "$TEMP_DIR/burp-stats.json"
 
-          # Verify minimum expected stats
-          URL_COUNT=$(python3 -c "
-          import json
-          s = json.load(open('${{ runner.temp }}/burp-stats.json'))
-          print(s['url_count'])
-          ")
+          URL_COUNT=$(python -c "import json, os; s=json.load(open(os.environ['TEMP_DIR'] + '/burp-stats.json')); print(s['url_count'])")
           echo "Extracted $URL_COUNT URLs from Burp XML"
           [ "$URL_COUNT" -gt 0 ] || { echo "::error::Burp XML has 0 URLs"; exit 1; }
 
@@ -261,24 +360,50 @@ jobs:
         uses: ./analyze-pcap-dast
         id: dast
         with:
-          har-file: ${{ steps.sitemap.outputs.har-file }}
+          har-file: ${{ env.HAR_FILE }}
           fail-on-risk: 'none'
           upload-sarif: 'true'
 
       - name: Verify DAST outputs
+        shell: bash
+        env:
+          SARIF_FILE: ${{ steps.dast.outputs.sarif-file }}
+          ALERT_COUNT: ${{ steps.dast.outputs.alert-count }}
+          HIGH_COUNT: ${{ steps.dast.outputs.high-count }}
+          MEDIUM_COUNT: ${{ steps.dast.outputs.medium-count }}
+          LOW_COUNT: ${{ steps.dast.outputs.low-count }}
         run: |
-          echo "SARIF file: ${{ steps.dast.outputs.sarif-file }}"
-          echo "Alerts: ${{ steps.dast.outputs.alert-count }}"
-          echo "  High: ${{ steps.dast.outputs.high-count }}"
-          echo "  Medium: ${{ steps.dast.outputs.medium-count }}"
-          echo "  Low: ${{ steps.dast.outputs.low-count }}"
+          set -euo pipefail
+          echo "SARIF file: $SARIF_FILE"
+          echo "Alerts: $ALERT_COUNT"
+          echo "  High: $HIGH_COUNT"
+          echo "  Medium: $MEDIUM_COUNT"
+          echo "  Low: $LOW_COUNT"
 
-          if [ -f "${{ steps.dast.outputs.sarif-file }}" ]; then
-            SIZE=$(stat -c%s "${{ steps.dast.outputs.sarif-file }}")
+          if [ -f "$SARIF_FILE" ]; then
+            SIZE=$(python -c "import os; from pathlib import Path; print(Path(os.environ['SARIF_FILE']).stat().st_size)")
             echo "SARIF size: $SIZE bytes"
             # Verify it's valid JSON
-            python3 -c "import json; json.load(open('${{ steps.dast.outputs.sarif-file }}'))"
+            python -c "import json, os; json.load(open(os.environ['SARIF_FILE']))"
             echo "SARIF is valid JSON"
           else
             echo "::error::SARIF file missing"; exit 1
+          fi
+
+      - name: Stop MinIO
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${MINIO_PID:-}" ]; then
+            echo "MINIO_PID not set; nothing to stop"
+            exit 0
+          fi
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            taskkill.exe /PID "$MINIO_PID" /T /F >/dev/null 2>&1 || true
+          else
+            kill -TERM "$MINIO_PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$MINIO_PID" 2>/dev/null || true
           fi
