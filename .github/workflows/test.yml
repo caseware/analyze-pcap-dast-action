@@ -53,19 +53,28 @@ jobs:
   # a site map, run ZAP passive scan, and upload SARIF to Security tab
   # ───────────────────────────────────────────────────────────────────
   test-dogfood:
-    name: "Dogfood: capture & analyze github.com (${{ matrix.platform.label }}, ${{ matrix.proxy-tool }})"
+    name: "Dogfood: ${{ matrix.scenario.label }} (${{ matrix.platform.label }}, ${{ matrix.proxy-tool }})"
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
         platform:
           - label: Linux
+            id: linux-arm64
             runner: ubuntu-24.04-arm
             kind: linux
           - label: Linux (AMD64)
+            id: linux-amd64
             runner: ubuntu-24.04
             kind: linux
         proxy-tool: [fluxzy, mitmproxy]
+        scenario:
+          - label: capture & analyze github.com
+            target: github
+            strip-bodies: 'false'
+          - label: strip bodies for juice-shop.github.io
+            target: juice-shop
+            strip-bodies: 'true'
     permissions:
       contents: read
       security-events: write
@@ -77,32 +86,6 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
-      - name: Install mitmproxy
-        if: matrix.proxy-tool == 'mitmproxy'
-        shell: bash
-        run: |
-          set -euo pipefail
-          MITM_VENV="$RUNNER_TEMP/mitmproxy-venv"
-          python -m venv "$MITM_VENV"
-
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            VENV_BIN="$MITM_VENV/Scripts"
-            VENV_PY="$VENV_BIN/python.exe"
-          else
-            VENV_BIN="$MITM_VENV/bin"
-            VENV_PY="$VENV_BIN/python"
-          fi
-
-          "$VENV_PY" -m pip install --upgrade pip
-          "$VENV_PY" -m pip install --quiet mitmproxy==11.0.2
-
-          echo "$VENV_BIN" >> "$GITHUB_PATH"
-          export PATH="$VENV_BIN:$PATH"
-
-      - name: Install Fluxzy
-        if: matrix.proxy-tool == 'fluxzy'
-        run: npm install -g @fluxzy/cli
 
       - name: Start MinIO
         shell: bash
@@ -187,134 +170,90 @@ jobs:
             aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000
           fi
 
-      - name: Capture traffic via selected proxy
+      - name: Configure dogfood prefix
         shell: bash
-        env:
-          PROXY_TOOL: ${{ matrix.proxy-tool }}
         run: |
           set -euo pipefail
-          PROXY_PID=""
-          cleanup() {
-            if [ -n "${PROXY_PID:-}" ]; then
-              kill -TERM "$PROXY_PID" 2>/dev/null || true
-              for i in $(seq 1 10); do
-                if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-                  return
-                fi
-                sleep 1
-              done
-              kill -9 "$PROXY_PID" 2>/dev/null || true
-            fi
-          }
-          trap cleanup EXIT
+          PREFIX="pcap-captures/dogfood/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.platform.id }}/${{ matrix.proxy-tool }}/${{ matrix.scenario.target }}"
+          echo "DOGFOOD_PREFIX=$PREFIX" >> "$GITHUB_ENV"
 
-          CAPTURE_DIR="${RUNNER_TEMP}/capture"
-          MITM_DIR="$CAPTURE_DIR/.mitmproxy"
-          FLUXZY_DIR="$CAPTURE_DIR/.fluxzy"
-          mkdir -p "$MITM_DIR" "$FLUXZY_DIR"
-          export SSLKEYLOGFILE="$CAPTURE_DIR/sslkeys.log"
+      - name: Start capture via capture-pcap-action
+        uses: caseware/capture-pcap-action/start@chore/fluxzy-support-and-validation
+        with:
+          proxy-tool: ${{ matrix.proxy-tool }}
+          strip-response-bodies: ${{ matrix.scenario.strip-bodies }}
+          strip-body-domains: 'juice-shop.github.io'
+          strip-body-content-types: 'text/html,image/,text/css,application/javascript,font/'
 
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            FLUXZY_BIN="npx.cmd"
-            CURL_BIN="curl.exe"
-            NULL_OUT="NUL"
-            USE_CACERT="false"
+      - name: Generate traffic through action-managed proxy
+        shell: bash
+        env:
+          TARGET_SCENARIO: ${{ matrix.scenario.target }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET_SCENARIO" = "juice-shop" ]; then
+            curl -sS --max-time 30 "https://juice-shop.github.io/" -o /dev/null || true
+            curl -sS --max-time 30 "https://juice-shop.github.io/juice-shop.svg" -o /dev/null || true
+            curl -sS --max-time 30 "https://juice-shop.github.io/assets/public/images/JuiceShop_Logo.png" -o /dev/null || true
           else
-            FLUXZY_BIN="npx"
-            CURL_BIN="curl"
-            NULL_OUT="/dev/null"
-            USE_CACERT="true"
+            curl -sS --max-time 30 "https://github.com/caseware/analyze-pcap-dast-action" -o /dev/null || true
+            curl -sS --max-time 30 "https://github.com/caseware" -o /dev/null || true
+            curl -sS --max-time 30 "https://api.github.com/repos/caseware/analyze-pcap-dast-action" -o /dev/null || true
           fi
 
-          if [ "$PROXY_TOOL" = "fluxzy" ]; then
-            "$FLUXZY_BIN" --yes @fluxzy/cli cert export "$FLUXZY_DIR/fluxzy-ca.crt"
-            CA_CERT="$FLUXZY_DIR/fluxzy-ca.crt"
-            CAPTURE_FILE="$CAPTURE_DIR/fluxzy-capture.har"
-            FLUXZY_DUMP_DIR="$CAPTURE_DIR/fluxzy-dump"
-            mkdir -p "$FLUXZY_DUMP_DIR"
-            "$FLUXZY_BIN" @fluxzy/cli start \
-              -l "127.0.0.1:8080" \
-              -k \
-              -d "$FLUXZY_DUMP_DIR" \
-              > "$CAPTURE_DIR/fluxzy-stdout.log" 2>&1 &
-          else
-            CAPTURE_FILE="$CAPTURE_DIR/mitmproxy-flows"
-            CA_CERT="$MITM_DIR/mitmproxy-ca-cert.pem"
-            mitmdump \
-              --mode regular \
-              --listen-port 8080 \
-              --set confdir="$MITM_DIR" \
-              --set ssl_insecure=true \
-              --save-stream-file "$CAPTURE_FILE" \
-              --quiet \
-              > "$CAPTURE_DIR/mitmdump-stdout.log" 2>&1 &
-          fi
-          PROXY_PID=$!
-
-          sleep 4
-
-          if [ "$USE_CACERT" = "true" ]; then
-            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" --cacert "$CA_CERT" "https://github.com/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
-            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" --cacert "$CA_CERT" "https://github.com/caseware" -o "$NULL_OUT" || true
-            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" --cacert "$CA_CERT" "https://api.github.com/repos/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
-          else
-            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" -k "https://github.com/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
-            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" -k "https://github.com/caseware" -o "$NULL_OUT" || true
-            "$CURL_BIN" -sS --max-time 30 -x "http://127.0.0.1:8080" -k "https://api.github.com/repos/caseware/analyze-pcap-dast-action" -o "$NULL_OUT" || true
-          fi
-
-          cleanup
-          trap - EXIT
-
-          # Generate HAR from Fluxzy dump if needed
-          if [ "$PROXY_TOOL" = "fluxzy" ] && [ -d "$FLUXZY_DUMP_DIR" ]; then
-            "$FLUXZY_BIN" @fluxzy/cli pack "$FLUXZY_DUMP_DIR" "$CAPTURE_FILE"
-          fi
-
-          for i in $(seq 1 10); do
-            if [ -f "$CAPTURE_FILE" ] && [ -s "$CAPTURE_FILE" ]; then
-              break
-            fi
-            sleep 1
-          done
-
-          if [ ! -f "$CAPTURE_FILE" ]; then
-            echo "::error::Expected capture file missing: $CAPTURE_FILE"
-            ls -la "$CAPTURE_DIR" || true
-            exit 1
-          fi
-          if [ ! -s "$CAPTURE_FILE" ]; then
-            echo "::error::Expected capture file is empty: $CAPTURE_FILE"
-            ls -la "$CAPTURE_DIR" || true
-            exit 1
-          fi
-
-          BUNDLE_DIR="$CAPTURE_DIR/bundle"
-          mkdir -p "$BUNDLE_DIR"
-          for f in mitmproxy-flows fluxzy-capture.har sslkeys.log; do
-            [ -f "$CAPTURE_DIR/$f" ] && cp "$CAPTURE_DIR/$f" "$BUNDLE_DIR/"
-          done
-          [ -f "$CA_CERT" ] && cp "$CA_CERT" "$BUNDLE_DIR/"
-
-          ARTIFACT="dogfood-$(date -u +%Y%m%dT%H%M%SZ)"
-          tar -czf "$CAPTURE_DIR/$ARTIFACT.tar.gz" -C "$BUNDLE_DIR" .
-
-          DATE_PARTITION=$(python -c "from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc)-timedelta(days=1)).strftime('%Y/%m/%d'))")
-          aws s3 cp "$CAPTURE_DIR/$ARTIFACT.tar.gz" \
-            "s3://test-pcap/pcap-captures/$DATE_PARTITION/$ARTIFACT.tar.gz" \
-            --endpoint-url http://localhost:9000
-
-          echo "capture-dir=$CAPTURE_DIR" >> "$GITHUB_ENV"
-          echo "Capture complete, uploaded to MinIO"
+      - name: Stop capture via capture-pcap-action
+        if: always()
+        uses: caseware/capture-pcap-action/stop@chore/fluxzy-support-and-validation
+        with:
+          s3-bucket: 'test-pcap'
+          s3-prefix: ${{ env.DOGFOOD_PREFIX }}
+          s3-endpoint: 'http://localhost:9000'
+          artifact-name: dogfood-${{ matrix.platform.id }}-${{ matrix.proxy-tool }}-${{ matrix.scenario.target }}
 
       - name: Create passive DAST site map
         uses: ./create-passive-dast-map
         id: sitemap
         with:
           s3-bucket: 'test-pcap'
-          s3-prefix: 'pcap-captures'
+          s3-prefix: ${{ env.DOGFOOD_PREFIX }}
           s3-endpoint: 'http://localhost:9000'
           days: '1'
+
+      - name: Verify strip markers in HAR
+        if: matrix.scenario.strip-bodies == 'true'
+        shell: bash
+        env:
+          HAR_FILE: ${{ steps.sitemap.outputs.har-file }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          har_path = Path(os.environ["HAR_FILE"])
+          data = json.loads(har_path.read_text(encoding="utf-8"))
+          entries = data.get("log", {}).get("entries", [])
+
+          strip_hits = 0
+          juice_hits = 0
+          for entry in entries:
+              req = entry.get("request", {})
+              res = entry.get("response", {})
+              url = str(req.get("url", ""))
+              if "juice-shop.github.io" not in url:
+                  continue
+              juice_hits += 1
+              headers = {h.get("name", "").lower(): h.get("value", "") for h in res.get("headers", [])}
+              if headers.get("x-capture-body-stripped", "").lower() == "true":
+                  strip_hits += 1
+
+          print(f"juice entries: {juice_hits}, stripped markers: {strip_hits}")
+          if juice_hits == 0:
+              raise SystemExit("No juice-shop entries found in HAR")
+          if strip_hits == 0:
+              raise SystemExit("No stripped response markers found in HAR")
+          PY
 
       - name: Export site map paths
         shell: bash

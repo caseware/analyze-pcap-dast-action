@@ -6,7 +6,7 @@ Uses the output from [capture-pcap-action](https://github.com/caseware/capture-p
 
 ### `create-passive-dast-map`
 
-Downloads capture bundles from date-partitioned S3 prefixes (last N full UTC days), auto-detects mitmproxy flow files and Fluxzy HAR captures, and generates site maps in three formats:
+Downloads capture bundles from date-partitioned S3 prefixes (last N full UTC days), reads captured HAR files, and generates site maps in three formats:
 
 | Format | File | Compatible With |
 |--------|------|-----------------|
