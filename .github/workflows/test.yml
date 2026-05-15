@@ -89,7 +89,7 @@ jobs:
 
       - name: Start capture via capture-pcap-action
         id: capture-start
-        uses: caseware/capture-pcap-action/start@chore/fluxzy-support-and-validation
+        uses: caseware/capture-pcap-action/start@v1
         with:
           proxy-tool: ${{ matrix.proxy-tool }}
           strip-response-bodies: ${{ matrix.scenario.strip-bodies }}
@@ -115,7 +115,7 @@ jobs:
       - name: Stop capture via capture-pcap-action
         id: capture-stop
         if: always()
-        uses: caseware/capture-pcap-action/stop@chore/fluxzy-support-and-validation
+        uses: caseware/capture-pcap-action/stop@v1
         with:
           capture-dir: ${{ steps.capture-start.outputs.capture-dir }}
           artifact-name: dogfood-${{ matrix.platform.id }}-${{ matrix.proxy-tool }}-${{ matrix.scenario.target }}
