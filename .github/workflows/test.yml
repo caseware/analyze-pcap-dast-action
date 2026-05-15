@@ -87,97 +87,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Start MinIO
-        shell: bash
-        run: |
-          set -euo pipefail
-          MINIO_DATA="$RUNNER_TEMP/minio-data"
-          mkdir -p "$MINIO_DATA"
-
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64|amd64) ARCH_TAG="amd64" ;;
-            arm64|aarch64) ARCH_TAG="arm64" ;;
-            *)
-              echo "::error::Unsupported architecture for MinIO: $ARCH"
-              exit 1
-              ;;
-          esac
-
-          case "$RUNNER_OS" in
-            Linux)
-              MINIO_URL="https://dl.min.io/server/minio/release/linux-${ARCH_TAG}/minio"
-              MINIO_BIN="$RUNNER_TEMP/minio"
-              ;;
-            macOS)
-              MINIO_URL="https://dl.min.io/server/minio/release/darwin-${ARCH_TAG}/minio"
-              MINIO_BIN="$RUNNER_TEMP/minio"
-              ;;
-            Windows)
-              MINIO_URL="https://dl.min.io/server/minio/release/windows-amd64/minio.exe"
-              MINIO_BIN="$RUNNER_TEMP/minio.exe"
-              ;;
-            *)
-              echo "::error::Unsupported runner OS for MinIO: $RUNNER_OS"
-              exit 1
-              ;;
-          esac
-
-          echo "Downloading MinIO from: $MINIO_URL"
-          curl -fsSL "$MINIO_URL" -o "$MINIO_BIN"
-          if [ "$RUNNER_OS" != "Windows" ]; then
-            chmod +x "$MINIO_BIN"
-          fi
-
-          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-            "$MINIO_BIN" server "$MINIO_DATA" --address ":9000" --console-address ":9001" \
-            > "$RUNNER_TEMP/minio.log" 2>&1 &
-          echo "MINIO_PID=$!" >> "$GITHUB_ENV"
-
-      - name: Wait for MinIO
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Waiting for MinIO..."
-          READY=false
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
-              echo "MinIO is ready"
-              READY=true
-              break
-            fi
-            sleep 1
-          done
-
-          if [ "$READY" != "true" ]; then
-            echo "::error::MinIO did not become ready within 60 seconds"
-            if [ -f "$RUNNER_TEMP/minio.log" ]; then
-              echo "::group::MinIO log"
-              tail -200 "$RUNNER_TEMP/minio.log" || true
-              echo "::endgroup::"
-            fi
-            exit 1
-          fi
-
-      - name: Configure AWS CLI for MinIO
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws configure set aws_access_key_id minioadmin
-          aws configure set aws_secret_access_key minioadmin
-          aws configure set default.region us-east-1
-          if ! aws s3 ls s3://test-pcap --endpoint-url http://localhost:9000 >/dev/null 2>&1; then
-            aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000
-          fi
-
-      - name: Configure dogfood prefix
-        shell: bash
-        run: |
-          set -euo pipefail
-          PREFIX="pcap-captures/dogfood/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.platform.id }}/${{ matrix.proxy-tool }}/${{ matrix.scenario.target }}"
-          echo "DOGFOOD_PREFIX=$PREFIX" >> "$GITHUB_ENV"
-
       - name: Start capture via capture-pcap-action
+        id: capture-start
         uses: caseware/capture-pcap-action/start@chore/fluxzy-support-and-validation
         with:
           proxy-tool: ${{ matrix.proxy-tool }}
@@ -202,28 +113,51 @@ jobs:
           fi
 
       - name: Stop capture via capture-pcap-action
+        id: capture-stop
         if: always()
         uses: caseware/capture-pcap-action/stop@chore/fluxzy-support-and-validation
         with:
-          s3-bucket: 'test-pcap'
-          s3-prefix: ${{ env.DOGFOOD_PREFIX }}
-          s3-endpoint: 'http://localhost:9000'
+          capture-dir: ${{ steps.capture-start.outputs.capture-dir }}
           artifact-name: dogfood-${{ matrix.platform.id }}-${{ matrix.proxy-tool }}-${{ matrix.scenario.target }}
 
-      - name: Create passive DAST site map
-        uses: ./create-passive-dast-map
-        id: sitemap
-        with:
-          s3-bucket: 'test-pcap'
-          s3-prefix: ${{ env.DOGFOOD_PREFIX }}
-          s3-endpoint: 'http://localhost:9000'
-          days: '1'
+      - name: Generate passive DAST site map from local capture
+        shell: bash
+        env:
+          CAPTURE_DIR: ${{ steps.capture-start.outputs.capture-dir }}
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR="$RUNNER_TEMP/dast-map"
+          mkdir -p "$OUTPUT_DIR/captures"
+
+          if [ ! -f "$CAPTURE_DIR/capture.har" ]; then
+            echo "::error::capture.har missing in $CAPTURE_DIR"
+            ls -la "$CAPTURE_DIR" || true
+            exit 1
+          fi
+
+          cp "$CAPTURE_DIR/capture.har" "$OUTPUT_DIR/captures/capture.har"
+
+          python3 scripts/flows-to-sitemap.py \
+            --captures-dir "$OUTPUT_DIR/captures" \
+            --output-dir "$OUTPUT_DIR"
+
+          HAR_FILE="$OUTPUT_DIR/sitemap.har"
+          URL_LIST="$OUTPUT_DIR/urls.txt"
+          BURP_XML="$OUTPUT_DIR/sitemap-burp.xml"
+          URL_COUNT=$(wc -l < "$URL_LIST" 2>/dev/null || echo 0)
+          DOMAIN_COUNT=$(awk -F/ '{print $3}' "$URL_LIST" 2>/dev/null | sort -u | wc -l || echo 0)
+
+          echo "HAR_FILE=$HAR_FILE" >> "$GITHUB_ENV"
+          echo "URL_LIST=$URL_LIST" >> "$GITHUB_ENV"
+          echo "BURP_XML=$BURP_XML" >> "$GITHUB_ENV"
+          echo "URL_COUNT=$URL_COUNT" >> "$GITHUB_ENV"
+          echo "DOMAIN_COUNT=$DOMAIN_COUNT" >> "$GITHUB_ENV"
 
       - name: Verify strip markers in HAR
         if: matrix.scenario.strip-bodies == 'true'
         shell: bash
         env:
-          HAR_FILE: ${{ steps.sitemap.outputs.har-file }}
+          HAR_FILE: ${{ env.HAR_FILE }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -254,21 +188,6 @@ jobs:
           if strip_hits == 0:
               raise SystemExit("No stripped response markers found in HAR")
           PY
-
-      - name: Export site map paths
-        shell: bash
-        env:
-          HAR_FILE: ${{ steps.sitemap.outputs.har-file }}
-          URL_LIST: ${{ steps.sitemap.outputs.url-list }}
-          BURP_XML: ${{ steps.sitemap.outputs.burp-xml }}
-          URL_COUNT: ${{ steps.sitemap.outputs.url-count }}
-          DOMAIN_COUNT: ${{ steps.sitemap.outputs.domain-count }}
-        run: |
-          echo "HAR_FILE=$HAR_FILE" >> "$GITHUB_ENV"
-          echo "URL_LIST=$URL_LIST" >> "$GITHUB_ENV"
-          echo "BURP_XML=$BURP_XML" >> "$GITHUB_ENV"
-          echo "URL_COUNT=$URL_COUNT" >> "$GITHUB_ENV"
-          echo "DOMAIN_COUNT=$DOMAIN_COUNT" >> "$GITHUB_ENV"
 
       - name: Verify site map outputs
         shell: bash
@@ -356,20 +275,3 @@ jobs:
             echo "::error::SARIF file missing"; exit 1
           fi
 
-      - name: Stop MinIO
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${MINIO_PID:-}" ]; then
-            echo "MINIO_PID not set; nothing to stop"
-            exit 0
-          fi
-
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            taskkill.exe /PID "$MINIO_PID" /T /F >/dev/null 2>&1 || true
-          else
-            kill -TERM "$MINIO_PID" 2>/dev/null || true
-            sleep 1
-            kill -9 "$MINIO_PID" 2>/dev/null || true
-          fi
