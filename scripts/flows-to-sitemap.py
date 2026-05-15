@@ -165,6 +165,11 @@ def _har_entry_to_har_entry(entry: dict[str, Any]) -> dict[str, Any]:
                     "postData": {
                         "mimeType": (request.get("postData") or {}).get("mimeType", ""),
                         "text": (request.get("postData") or {}).get("text", ""),
+                        **(
+                            {"params": (request.get("postData") or {}).get("params")}
+                            if "params" in (request.get("postData") or {})
+                            else {}
+                        ),
                     }
                 }
                 if request.get("postData")
