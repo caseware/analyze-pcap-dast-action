@@ -140,6 +140,13 @@ def _sanitize_har_cookies(cookies: list[dict[str, Any]] | None) -> list[dict[str
     return [_sanitize_har_cookie(c) for c in cookies]
 
 
+def _normalize_http_version(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if re.fullmatch(r"HTTP/\d+(?:\.\d+)?", candidate):
+        return candidate
+    return "HTTP/1.1"
+
+
 def _har_entry_to_har_entry(entry: dict[str, Any]) -> dict[str, Any]:
     started = entry.get("startedDateTime") or datetime.now(tz=timezone.utc).isoformat()
     request = entry.get("request") or {}
@@ -154,7 +161,7 @@ def _har_entry_to_har_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "request": {
             "method": request.get("method", "GET"),
             "url": request.get("url", ""),
-            "httpVersion": request.get("httpVersion", "HTTP/1.1"),
+            "httpVersion": _normalize_http_version(request.get("httpVersion")),
             "cookies": _sanitize_har_cookies(request.get("cookies") or []),
             "headers": _har_header_list(request.get("headers")),
             "queryString": request.get("queryString") or [],
@@ -179,7 +186,7 @@ def _har_entry_to_har_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "response": {
             "status": int(response.get("status") or 0),
             "statusText": response.get("statusText", ""),
-            "httpVersion": response.get("httpVersion", "HTTP/1.1"),
+            "httpVersion": _normalize_http_version(response.get("httpVersion")),
             "cookies": _sanitize_har_cookies(response.get("cookies") or []),
             "headers": _har_header_list(response.get("headers")),
             "content": {
@@ -207,6 +214,9 @@ def _har_entry_to_burp_item(entry: dict[str, Any]) -> ET.Element:
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
+    path_without_query = path.split("?", 1)[0]
+    request_http_version = _normalize_http_version(request.get("httpVersion"))
+    response_http_version = _normalize_http_version(response.get("httpVersion"))
 
     item = ET.Element("item")
     started_dt = entry.get("startedDateTime") or datetime.now(tz=timezone.utc).isoformat()
@@ -222,10 +232,10 @@ def _har_entry_to_burp_item(entry: dict[str, Any]) -> ET.Element:
     ET.SubElement(item, "method").text = method
     ET.SubElement(item, "path").text = path
     ET.SubElement(item, "extension").text = (
-        path.rsplit(".", 1)[-1][:10] if "." in path.split("?")[0] else ""
+        path_without_query.rsplit(".", 1)[-1][:10] if "." in path_without_query else ""
     )
 
-    raw_req = method + " " + path + " " + str(request.get("httpVersion", "HTTP/1.1")) + "\r\n"
+    raw_req = method + " " + path + " " + request_http_version + "\r\n"
     for h in _har_header_list(request.get("headers")):
         raw_req += h["name"] + ": " + h["value"] + "\r\n"
     raw_req += "\r\n"
@@ -243,7 +253,7 @@ def _har_entry_to_burp_item(entry: dict[str, Any]) -> ET.Element:
     ET.SubElement(item, "mimetype").text = str(content.get("mimeType") or "")
 
     raw_resp = (
-        str(response.get("httpVersion", "HTTP/1.1"))
+        response_http_version
         + " "
         + str(status)
         + " "
