@@ -98,16 +98,14 @@ runs:
         set -euo pipefail
 
         echo "::group::Running ZAP passive scan"
-        # Create a minimal passwd so the container resolves HOME to /zap
-        ZAP_PASSWD="$WORK_DIR/passwd"
-        echo "zap:x:$(id -u):$(id -g):zap:/zap:/sbin/nologin" > "$ZAP_PASSWD"
-        # Pre-create .ZAP home dir — runner UID can't write to /zap/ in the image
-        ZAP_HOME_DIR="$WORK_DIR/dot-ZAP"
-        mkdir -p "$ZAP_HOME_DIR"
+        ZAP_HOME_DIR="$WORK_DIR/zap-home"
+        ZAP_PREFS_DIR="$ZAP_HOME_DIR/.java/.userPrefs"
+        mkdir -p "$ZAP_HOME_DIR/.ZAP" "$ZAP_PREFS_DIR"
         docker run --rm \
           --user "$(id -u):$(id -g)" \
-          -v "$ZAP_PASSWD:/etc/passwd:ro" \
-          -v "$ZAP_HOME_DIR:/zap/.ZAP:rw" \
+          -e HOME=/zap-home \
+          -e JAVA_TOOL_OPTIONS="-Djava.util.prefs.userRoot=/zap-home/.java/.userPrefs" \
+          -v "$ZAP_HOME_DIR:/zap-home:rw" \
           -v "$WORK_DIR:/zap/wrk:rw" \
           "$ZAP_IMAGE" \
           zap.sh -cmd \
