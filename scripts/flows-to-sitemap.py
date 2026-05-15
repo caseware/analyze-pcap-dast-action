@@ -185,7 +185,7 @@ def _har_entry_to_har_entry(entry: dict[str, Any]) -> dict[str, Any]:
         },
         "response": {
             "status": int(response.get("status") or 0),
-            "statusText": response.get("statusText", ""),
+            "statusText": response.get("statusText") or "",
             "httpVersion": _normalize_http_version(response.get("httpVersion")),
             "cookies": _sanitize_har_cookies(response.get("cookies") or []),
             "headers": _har_header_list(response.get("headers")),
@@ -257,7 +257,7 @@ def _har_entry_to_burp_item(entry: dict[str, Any]) -> ET.Element:
         + " "
         + str(status)
         + " "
-        + str(response.get("statusText", ""))
+        + str(response.get("statusText") or "")
         + "\r\n"
     )
     for h in _har_header_list(response.get("headers")):
