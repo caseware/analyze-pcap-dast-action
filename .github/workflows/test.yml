@@ -21,7 +21,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Validate VERSION bump
@@ -53,140 +53,150 @@ jobs:
   # a site map, run ZAP passive scan, and upload SARIF to Security tab
   # ───────────────────────────────────────────────────────────────────
   test-dogfood:
-    name: "Dogfood: capture & analyze github.com"
-    runs-on: ubuntu-24.04-arm
+    name: "Dogfood: ${{ matrix.scenario.label }} (${{ matrix.platform.label }}, ${{ matrix.proxy-tool }})"
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - label: Linux
+            id: linux-arm64
+            runner: ubuntu-24.04-arm
+            kind: linux
+          - label: Linux (AMD64)
+            id: linux-amd64
+            runner: ubuntu-24.04
+            kind: linux
+        proxy-tool: [fluxzy, mitmproxy]
+        scenario:
+          - label: capture & analyze github.com
+            target: github
+            strip-bodies: 'false'
+          - label: strip bodies for juice-shop.github.io
+            target: juice-shop
+            strip-bodies: 'true'
     permissions:
       contents: read
       security-events: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-      - name: Install mitmproxy
-        run: |
-          pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
-            pip install --quiet --break-system-packages mitmproxy==11.0.2
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
+      - name: Start capture via capture-pcap-action
+        id: capture-start
+        uses: caseware/capture-pcap-action/start@v1
+        with:
+          proxy-tool: ${{ matrix.proxy-tool }}
+          strip-response-bodies: ${{ matrix.scenario.strip-bodies }}
+          strip-body-domains: 'juice-shop.github.io'
+          strip-body-content-types: 'text/html,image/,text/css,application/javascript,font/'
 
-      - name: Start MinIO (S3-compatible storage)
-        run: |
-          docker run -d --name minio \
-            -p 9000:9000 -p 9001:9001 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-06-13T11-33-47Z server /data --console-address ":9001"
-
-          echo "Waiting for MinIO..."
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
-              echo "MinIO is ready"
-              break
-            fi
-            sleep 1
-          done
-
-          # Configure AWS CLI for MinIO
-          aws configure set aws_access_key_id minioadmin
-          aws configure set aws_secret_access_key minioadmin
-          aws configure set default.region us-east-1
-
-          aws s3 mb s3://test-pcap --endpoint-url http://localhost:9000
-
-      - name: Capture traffic via mitmproxy
+      - name: Generate traffic through action-managed proxy
+        shell: bash
+        env:
+          TARGET_SCENARIO: ${{ matrix.scenario.target }}
         run: |
           set -euo pipefail
-          CAPTURE_DIR="${RUNNER_TEMP}/capture"
-          mkdir -p "$CAPTURE_DIR/.mitmproxy"
+          if [ "$TARGET_SCENARIO" = "juice-shop" ]; then
+            curl -sS --max-time 30 "https://juice-shop.github.io/" -o /dev/null || true
+            curl -sS --max-time 30 "https://juice-shop.github.io/juice-shop.svg" -o /dev/null || true
+            curl -sS --max-time 30 "https://juice-shop.github.io/assets/public/images/JuiceShop_Logo.png" -o /dev/null || true
+          else
+            curl -sS --max-time 30 "https://github.com/caseware/analyze-pcap-dast-action" -o /dev/null || true
+            curl -sS --max-time 30 "https://github.com/caseware" -o /dev/null || true
+            curl -sS --max-time 30 "https://api.github.com/repos/caseware/analyze-pcap-dast-action" -o /dev/null || true
+          fi
 
-          export SSLKEYLOGFILE="$CAPTURE_DIR/sslkeys.log"
-
-          # Start mitmproxy
-          mitmdump \
-            --mode regular \
-            --listen-port 8080 \
-            --set confdir="$CAPTURE_DIR/.mitmproxy" \
-            --set ssl_insecure=true \
-            --save-stream-file "$CAPTURE_DIR/mitmproxy-flows" \
-            --quiet &
-          MITM_PID=$!
-          echo "$MITM_PID" > "$CAPTURE_DIR/mitmdump.pid"
-          sleep 3
-
-          CA_CERT="$CAPTURE_DIR/.mitmproxy/mitmproxy-ca-cert.pem"
-
-          # Make requests through the proxy to this repo's GitHub page
-          export http_proxy=http://127.0.0.1:8080
-          export https_proxy=http://127.0.0.1:8080
-
-          echo "::group::Fetching GitHub pages"
-
-          curl -sS --max-time 30 --cacert "$CA_CERT" \
-            -o /dev/null -w "repo page: HTTP %{http_code}\n" \
-            https://github.com/caseware/analyze-pcap-dast-action || true
-
-          curl -sS --max-time 30 --cacert "$CA_CERT" \
-            -o /dev/null -w "org page: HTTP %{http_code}\n" \
-            https://github.com/caseware || true
-
-          curl -sS --max-time 30 --cacert "$CA_CERT" \
-            -o /dev/null -w "github api: HTTP %{http_code}\n" \
-            https://api.github.com/repos/caseware/analyze-pcap-dast-action || true
-
-          echo "::endgroup::"
-
-          unset http_proxy https_proxy
-
-          # Stop mitmproxy
-          kill "$MITM_PID" 2>/dev/null || true
-          sleep 2
-          kill -9 "$MITM_PID" 2>/dev/null || true
-
-          # Bundle and upload to MinIO
-          BUNDLE_DIR="$CAPTURE_DIR/bundle"
-          mkdir -p "$BUNDLE_DIR"
-          for f in mitmproxy-flows sslkeys.log; do
-            [ -f "$CAPTURE_DIR/$f" ] && cp "$CAPTURE_DIR/$f" "$BUNDLE_DIR/"
-          done
-          [ -f "$CA_CERT" ] && cp "$CA_CERT" "$BUNDLE_DIR/"
-
-          ARTIFACT="dogfood-$(date +%Y%m%dT%H%M%SZ)"
-          tar -czf "$CAPTURE_DIR/$ARTIFACT.tar.gz" -C "$BUNDLE_DIR" .
-
-          # Upload to yesterday's partition (action looks back at previous days)
-          DATE_PARTITION=$(date -u -d "1 day ago" +%Y/%m/%d)
-          aws s3 cp "$CAPTURE_DIR/$ARTIFACT.tar.gz" \
-            "s3://test-pcap/pcap-captures/$DATE_PARTITION/$ARTIFACT.tar.gz" \
-            --endpoint-url http://localhost:9000
-
-          echo "capture-dir=$CAPTURE_DIR" >> "$GITHUB_ENV"
-          echo "Capture complete, uploaded to MinIO"
-
-      - name: Create passive DAST site map
-        uses: ./create-passive-dast-map
-        id: sitemap
+      - name: Stop capture via capture-pcap-action
+        id: capture-stop
+        if: always()
+        uses: caseware/capture-pcap-action/stop@v1
         with:
-          s3-bucket: 'test-pcap'
-          s3-prefix: 'pcap-captures'
-          s3-endpoint: 'http://localhost:9000'
-          days: '1'
+          capture-dir: ${{ steps.capture-start.outputs.capture-dir }}
+          artifact-name: dogfood-${{ matrix.platform.id }}-${{ matrix.proxy-tool }}-${{ matrix.scenario.target }}
+
+      - name: Generate passive DAST site map from local capture
+        shell: bash
+        env:
+          CAPTURE_DIR: ${{ steps.capture-start.outputs.capture-dir }}
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR="$RUNNER_TEMP/dast-map"
+          mkdir -p "$OUTPUT_DIR/captures"
+
+          if [ ! -f "$CAPTURE_DIR/capture.har" ]; then
+            echo "::error::capture.har missing in $CAPTURE_DIR"
+            ls -la "$CAPTURE_DIR" || true
+            exit 1
+          fi
+
+          cp "$CAPTURE_DIR/capture.har" "$OUTPUT_DIR/captures/capture.har"
+
+          python3 scripts/flows-to-sitemap.py \
+            --captures-dir "$OUTPUT_DIR/captures" \
+            --output-dir "$OUTPUT_DIR"
+
+          HAR_FILE="$OUTPUT_DIR/sitemap.har"
+          URL_LIST="$OUTPUT_DIR/urls.txt"
+          BURP_XML="$OUTPUT_DIR/sitemap-burp.xml"
+          URL_COUNT=$(wc -l < "$URL_LIST" 2>/dev/null || echo 0)
+          DOMAIN_COUNT=$(awk -F/ '{print $3}' "$URL_LIST" 2>/dev/null | sort -u | wc -l || echo 0)
+
+          echo "HAR_FILE=$HAR_FILE" >> "$GITHUB_ENV"
+          echo "URL_LIST=$URL_LIST" >> "$GITHUB_ENV"
+          echo "BURP_XML=$BURP_XML" >> "$GITHUB_ENV"
+          echo "URL_COUNT=$URL_COUNT" >> "$GITHUB_ENV"
+          echo "DOMAIN_COUNT=$DOMAIN_COUNT" >> "$GITHUB_ENV"
+
+      - name: Verify strip markers in HAR
+        if: matrix.scenario.strip-bodies == 'true'
+        shell: bash
+        env:
+          HAR_FILE: ${{ env.HAR_FILE }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          har_path = Path(os.environ["HAR_FILE"])
+          data = json.loads(har_path.read_text(encoding="utf-8"))
+          entries = data.get("log", {}).get("entries", [])
+
+          strip_hits = 0
+          juice_hits = 0
+          for entry in entries:
+              req = entry.get("request", {})
+              res = entry.get("response", {})
+              url = str(req.get("url", ""))
+              if "juice-shop.github.io" not in url:
+                  continue
+              juice_hits += 1
+              headers = {h.get("name", "").lower(): h.get("value", "") for h in res.get("headers", [])}
+              if headers.get("x-capture-body-stripped", "").lower() == "true":
+                  strip_hits += 1
+
+          print(f"juice entries: {juice_hits}, stripped markers: {strip_hits}")
+          if juice_hits == 0:
+              raise SystemExit("No juice-shop entries found in HAR")
+          if strip_hits == 0:
+              raise SystemExit("No stripped response markers found in HAR")
+          PY
 
       - name: Verify site map outputs
+        shell: bash
         run: |
           set -euo pipefail
           echo "=== HAR ==="
-          if [ -f "${{ steps.sitemap.outputs.har-file }}" ]; then
-            SIZE=$(stat -c%s "${{ steps.sitemap.outputs.har-file }}")
-            ENTRIES=$(python3 -c "
-          import json
-          with open('${{ steps.sitemap.outputs.har-file }}') as f:
-              print(len(json.load(f)['log']['entries']))
-          ")
+          if [ -f "$HAR_FILE" ]; then
+            SIZE=$(python -c "import os; from pathlib import Path; print(Path(os.environ['HAR_FILE']).stat().st_size)")
+            ENTRIES=$(python -c "import json, os; print(len(json.load(open(os.environ['HAR_FILE']))['log']['entries']))")
             echo "HAR: $SIZE bytes, $ENTRIES entries"
             [ "$SIZE" -gt 100 ] || { echo "::error::HAR too small"; exit 1; }
           else
@@ -194,9 +204,9 @@ jobs:
           fi
 
           echo "=== URL list ==="
-          if [ -f "${{ steps.sitemap.outputs.url-list }}" ]; then
-            cat "${{ steps.sitemap.outputs.url-list }}"
-            LINES=$(wc -l < "${{ steps.sitemap.outputs.url-list }}")
+          if [ -f "$URL_LIST" ]; then
+            cat "$URL_LIST"
+            LINES=$(python -c "import os; from pathlib import Path; print(len(Path(os.environ['URL_LIST']).read_text().splitlines()))")
             echo "URLs: $LINES"
             [ "$LINES" -gt 0 ] || { echo "::error::URL list empty"; exit 1; }
           else
@@ -204,58 +214,64 @@ jobs:
           fi
 
           echo "=== Burp XML ==="
-          if [ -f "${{ steps.sitemap.outputs.burp-xml }}" ]; then
-            SIZE=$(stat -c%s "${{ steps.sitemap.outputs.burp-xml }}")
+          if [ -f "$BURP_XML" ]; then
+            SIZE=$(python -c "import os; from pathlib import Path; print(Path(os.environ['BURP_XML']).stat().st_size)")
             echo "Burp XML: $SIZE bytes"
             [ "$SIZE" -gt 100 ] || { echo "::error::Burp XML too small"; exit 1; }
           else
             echo "::error::Burp XML missing"; exit 1
           fi
 
-          echo "URL count: ${{ steps.sitemap.outputs.url-count }}"
-          echo "Domain count: ${{ steps.sitemap.outputs.domain-count }}"
+          echo "URL count: ${URL_COUNT:-n/a}"
+          echo "Domain count: ${DOMAIN_COUNT:-n/a}"
 
       - name: Extract Burp XML statistics
+        shell: bash
+        env:
+          TEMP_DIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          python3 scripts/burp-xml-stats.py \
-            "${{ steps.sitemap.outputs.burp-xml }}" \
-            -o "${{ runner.temp }}/burp-stats.json"
-
+          python scripts/burp-xml-stats.py "$BURP_XML" -o "$TEMP_DIR/burp-stats.json"
           echo "=== Burp XML Stats ==="
-          cat "${{ runner.temp }}/burp-stats.json"
+          cat "$TEMP_DIR/burp-stats.json"
 
-          # Verify minimum expected stats
-          URL_COUNT=$(python3 -c "
-          import json
-          s = json.load(open('${{ runner.temp }}/burp-stats.json'))
-          print(s['url_count'])
-          ")
+          URL_COUNT=$(python -c "import json, os; s=json.load(open(os.environ['TEMP_DIR'] + '/burp-stats.json')); print(s['url_count'])")
           echo "Extracted $URL_COUNT URLs from Burp XML"
           [ "$URL_COUNT" -gt 0 ] || { echo "::error::Burp XML has 0 URLs"; exit 1; }
 
       - name: Run DAST passive analysis
+        if: runner.os == 'Linux'
         uses: ./analyze-pcap-dast
         id: dast
         with:
-          har-file: ${{ steps.sitemap.outputs.har-file }}
+          har-file: ${{ env.HAR_FILE }}
           fail-on-risk: 'none'
           upload-sarif: 'true'
 
       - name: Verify DAST outputs
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          SARIF_FILE: ${{ steps.dast.outputs.sarif-file }}
+          ALERT_COUNT: ${{ steps.dast.outputs.alert-count }}
+          HIGH_COUNT: ${{ steps.dast.outputs.high-count }}
+          MEDIUM_COUNT: ${{ steps.dast.outputs.medium-count }}
+          LOW_COUNT: ${{ steps.dast.outputs.low-count }}
         run: |
-          echo "SARIF file: ${{ steps.dast.outputs.sarif-file }}"
-          echo "Alerts: ${{ steps.dast.outputs.alert-count }}"
-          echo "  High: ${{ steps.dast.outputs.high-count }}"
-          echo "  Medium: ${{ steps.dast.outputs.medium-count }}"
-          echo "  Low: ${{ steps.dast.outputs.low-count }}"
+          set -euo pipefail
+          echo "SARIF file: $SARIF_FILE"
+          echo "Alerts: $ALERT_COUNT"
+          echo "  High: $HIGH_COUNT"
+          echo "  Medium: $MEDIUM_COUNT"
+          echo "  Low: $LOW_COUNT"
 
-          if [ -f "${{ steps.dast.outputs.sarif-file }}" ]; then
-            SIZE=$(stat -c%s "${{ steps.dast.outputs.sarif-file }}")
+          if [ -f "$SARIF_FILE" ]; then
+            SIZE=$(python -c "import os; from pathlib import Path; print(Path(os.environ['SARIF_FILE']).stat().st_size)")
             echo "SARIF size: $SIZE bytes"
             # Verify it's valid JSON
-            python3 -c "import json; json.load(open('${{ steps.dast.outputs.sarif-file }}'))"
+            python -c "import json, os; json.load(open(os.environ['SARIF_FILE']))"
             echo "SARIF is valid JSON"
           else
             echo "::error::SARIF file missing"; exit 1
           fi
+

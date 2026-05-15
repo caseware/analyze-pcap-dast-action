@@ -1,8 +1,8 @@
 name: 'Create Passive DAST Site Map'
 description: |
   Downloads PCAP bundles from date-partitioned S3 prefixes (last N full UTC days),
-  extracts mitmproxy flows, and generates site maps compatible with ZAP, Burp Suite,
-  and Rapid7.
+  extracts captured HAR exchanges, and generates site maps compatible with ZAP,
+  Burp Suite, and Rapid7.
 
   Output formats:
     - HAR (HTTP Archive 1.2) — universal, works with ZAP/Burp/Rapid7
@@ -67,14 +67,6 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Install Python dependencies
-      shell: bash
-      run: |
-        pip install --quiet mitmproxy==11.0.2 2>/dev/null || \
-          pip install --quiet --break-system-packages mitmproxy==11.0.2
-        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-        export PATH="$HOME/.local/bin:$PATH"
-
     - name: Download and extract PCAP bundles from S3
       id: download
       shell: bash
@@ -86,7 +78,7 @@ runs:
         OUTPUT_DIR: ${{ inputs.output-dir }}
       run: |
         set -euo pipefail
-        mkdir -p "$OUTPUT_DIR/bundles" "$OUTPUT_DIR/flows"
+        mkdir -p "$OUTPUT_DIR/bundles" "$OUTPUT_DIR/captures"
 
         ENDPOINT_FLAG=""
         if [ -n "$S3_ENDPOINT" ]; then
@@ -118,19 +110,26 @@ runs:
             mkdir -p "$BUNDLE_DIR"
             tar -xzf "$tarball" -C "$BUNDLE_DIR"
 
-            if [ -f "$BUNDLE_DIR/mitmproxy-flows" ]; then
-              cp "$BUNDLE_DIR/mitmproxy-flows" \
-                 "$OUTPUT_DIR/flows/${BUNDLE_NAME}.flows"
+            if [ -f "$BUNDLE_DIR/capture.har" ]; then
+              cp "$BUNDLE_DIR/capture.har" \
+                 "$OUTPUT_DIR/captures/${BUNDLE_NAME}.har"
+              BUNDLE_COUNT=$((BUNDLE_COUNT + 1))
+            elif [ -f "$BUNDLE_DIR/fluxzy-capture.har" ]; then
+              # Backward compatibility with older bundles
+              cp "$BUNDLE_DIR/fluxzy-capture.har" \
+                 "$OUTPUT_DIR/captures/${BUNDLE_NAME}.har"
               BUNDLE_COUNT=$((BUNDLE_COUNT + 1))
             fi
           done
         done
 
-        echo "Downloaded $BUNDLE_COUNT bundles with flow files"
-        ls -la "$OUTPUT_DIR/flows/" 2>/dev/null || echo "(no flows found)"
+        echo "Downloaded $BUNDLE_COUNT bundles with HAR files"
+        ls -la "$OUTPUT_DIR/captures/" 2>/dev/null || echo "(no HAR files found)"
+        HAR_FILE_COUNT=$(find "$OUTPUT_DIR/captures" -maxdepth 1 -type f -name '*.har' | wc -l | tr -d ' ')
+        echo "har-file-count=$HAR_FILE_COUNT" >> "$GITHUB_OUTPUT"
         echo "output-dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
 
-    - name: Generate site maps from mitmproxy flows
+    - name: Generate site maps from captured exchanges
       id: generate
       shell: bash
       env:
@@ -139,10 +138,10 @@ runs:
         FILTER_EXCLUDE_DOMAINS: ${{ inputs.filter-exclude-domains }}
         FILTER_STATUS_CODES: ${{ inputs.filter-status-codes }}
         FILTER_METHODS: ${{ inputs.filter-methods }}
+        SCRIPT_DIR: ${{ github.action_path }}/../scripts
       run: |
-        SCRIPT_DIR="${{ github.action_path }}/../scripts"
         python3 "$SCRIPT_DIR/flows-to-sitemap.py" \
-          --flows-dir "$OUTPUT_DIR/flows" \
+          --captures-dir "$OUTPUT_DIR/captures" \
           --output-dir "$OUTPUT_DIR" \
           --filter-domains "$FILTER_DOMAINS" \
           --filter-exclude-domains "$FILTER_EXCLUDE_DOMAINS" \
