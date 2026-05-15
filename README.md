@@ -1,12 +1,12 @@
 # analyze-pcap-dast-action
 
-Uses the output from [capture-pcap-action](https://github.com/caseware/capture-pcap-action) and analyses it with DAST tools. Contains two composite actions:
+Analyzes HAR bundles produced by [capture-pcap-action](https://github.com/caseware/capture-pcap-action) and runs passive DAST workflows. Supports captures generated through both `mitmproxy` and `fluxzy` by consuming standardized HAR output from the capture action. Contains two composite actions:
 
 ## Actions
 
 ### `create-passive-dast-map`
 
-Downloads capture bundles from date-partitioned S3 prefixes (last N full UTC days), reads captured HAR files, and generates site maps in three formats:
+Downloads capture bundles from date-partitioned S3 prefixes (last N full UTC days), reads captured HAR files (`capture.har`, including legacy fallback `fluxzy-capture.har`), and generates site maps in three formats:
 
 | Format | File | Compatible With |
 |--------|------|-----------------|
@@ -41,6 +41,8 @@ Downloads capture bundles from date-partitioned S3 prefixes (last N full UTC day
 > **Note:** Content-type filtering is applied upstream by `capture-pcap-action`'s
 > selected proxy capture path (`filter-content-types` input). Capture data that reaches S3
 > have already been filtered, so a duplicate content-type filter is not needed here.
+
+> **Proxy compatibility:** This action is HAR-first and proxy-agnostic. As long as the capture step writes HAR into the bundle, both `mitmproxy` and `fluxzy` traffic are processed through the same analysis path.
 
 #### Outputs
 
@@ -136,9 +138,9 @@ jobs:
 
 ## CI
 
-All workflows run on `ubuntu-24.04-arm` (ARM64-first). The repo dogfoods both actions by capturing traffic to its own GitHub.com page and analyzing it with ZAP.
+All workflows run on `ubuntu-24.04-arm` (ARM64-first). The repo dogfoods both actions by validating HAR captures from both supported proxy tools (`mitmproxy` and `fluxzy`) and analyzing the generated site map with ZAP.
 
-- **Integration test** — captures HTTPS traffic via the capture action, generates site maps, runs ZAP passive scan, uploads SARIF
+- **Integration test** — captures HTTPS traffic via the capture action (both proxy modes), generates HAR-backed site maps, runs ZAP passive scan, uploads SARIF
 - **CodeQL** — scans Python and Actions YAML via `caseware/codeql-arm64-compat`
 - **Commitlint** — enforces Conventional Commits
 
