@@ -98,11 +98,14 @@ runs:
         set -euo pipefail
 
         echo "::group::Running ZAP passive scan"
+        ZAP_PASSWD="$WORK_DIR/passwd"
         ZAP_HOME_DIR="$WORK_DIR/zap-home"
         ZAP_PREFS_DIR="$ZAP_HOME_DIR/.java/.userPrefs"
+        echo "zap:x:$(id -u):$(id -g):zap:/zap-home:/sbin/nologin" > "$ZAP_PASSWD"
         mkdir -p "$ZAP_HOME_DIR/.ZAP" "$ZAP_PREFS_DIR"
         docker run --rm \
           --user "$(id -u):$(id -g)" \
+          -v "$ZAP_PASSWD:/etc/passwd:ro" \
           -e HOME=/zap-home \
           -e JAVA_TOOL_OPTIONS="-Djava.util.prefs.userRoot=/zap-home/.java/.userPrefs" \
           -v "$ZAP_HOME_DIR:/zap-home:rw" \
